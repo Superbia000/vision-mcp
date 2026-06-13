@@ -77,6 +77,16 @@ export const COST_POLICY =
 export const CACHE_POLICY =
   (process.env.VISION_CACHE_POLICY as "auto" | "off" | "explicit") || "auto";
 export const RETURN_COST_BREAKDOWN = process.env.VISION_RETURN_COST_BREAKDOWN !== "false";
+export const PRESERVE_ALL = process.env.VISION_PRESERVE_ALL !== "false";
+export const OUTPUT_SCHEMA = process.env.VISION_OUTPUT_SCHEMA || "lossless_document_v1";
+export const PREPROCESS_PROFILE = process.env.VISION_PREPROCESS_PROFILE || "auto";
+export const AI_ENHANCE = process.env.VISION_AI_ENHANCE || "off";
+export const AI_ENHANCE_ENGINE = process.env.VISION_AI_ENHANCE_ENGINE || "swinir_cpu";
+export const AI_ENHANCE_SCOPE = process.env.VISION_AI_ENHANCE_SCOPE || "crops";
+export const RENDER_CONCURRENCY = Number(process.env.VISION_RENDER_CONCURRENCY) || 2;
+export const REALTIME_CONCURRENCY = Number(process.env.VISION_REALTIME_CONCURRENCY) || 4;
+export const CROP_OCR_CONCURRENCY = Number(process.env.VISION_CROP_OCR_CONCURRENCY) || 6;
+export const BATCH_POLICY = process.env.VISION_BATCH_POLICY || "auto";
 export const MAX_UNVERIFIED_REQUIRED_FIELDS = (() => {
   const n = Number(process.env.VISION_MAX_UNVERIFIED_REQUIRED_FIELDS);
   return isNaN(n) || n < 0 ? 0 : n;
@@ -241,6 +251,8 @@ export function logConfig() {
     `edge_enhance=${ENABLE_EDGE_ENHANCE} adaptive_thresh=${ENABLE_ADAPTIVE_THRESHOLD} | ` +
     `ocr_model=${OCR_MODEL} render_cache=${RENDER_CACHE_ENABLED} | ` +
     `cost=${COST_POLICY} cache=${CACHE_POLICY} cost_breakdown=${RETURN_COST_BREAKDOWN} max_unverified_required=${MAX_UNVERIFIED_REQUIRED_FIELDS} | ` +
+    `preserve_all=${PRESERVE_ALL} schema=${OUTPUT_SCHEMA} preprocess_profile=${PREPROCESS_PROFILE} ai_enhance=${AI_ENHANCE}/${AI_ENHANCE_ENGINE}/${AI_ENHANCE_SCOPE} | ` +
+    `queues render=${RENDER_CONCURRENCY} realtime=${REALTIME_CONCURRENCY} crop_ocr=${CROP_OCR_CONCURRENCY} batch_policy=${BATCH_POLICY} | ` +
     `strategy=${EXTRACTION_STRATEGY} scanned=${SCANNED_STRATEGY} multipass=${MULTIPASS_ENABLED}@${MULTIPASS_VOTES} | ` +
     `l2_pad=${L2_CROP_PADDING} l2_pp=${L2_PREPROCESS_ENABLED} | ` +
     `quality: min_ocr_q=${MIN_OCR_QUALITY} prep_think=${PREPROCESS_WITH_THINKING} l1_to=${L1_TIMEOUT_MS}ms l4_ce=${L4_ONLY_HIGH_CE} sp=${SECOND_PASS_ENABLED}@${SECOND_PASS_MODEL} | ` +

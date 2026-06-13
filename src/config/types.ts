@@ -125,6 +125,55 @@ export interface LayeredExtractionResult {
   };
 }
 
+export interface LosslessTextItem {
+  text: string;
+  bbox?: { x1: number; y1: number; x2: number; y2: number };
+  confidence?: "high" | "medium" | "low";
+  source?: string;
+}
+
+export interface LosslessFieldCandidate {
+  name?: string;
+  label?: string;
+  value: string;
+  bbox?: { x1: number; y1: number; x2: number; y2: number };
+  confidence?: "high" | "medium" | "low";
+  source?: string;
+  needs_review?: boolean;
+}
+
+export interface LosslessPage {
+  page: number;
+  raw_markdown: string;
+  raw_html?: string;
+  text_items: LosslessTextItem[];
+  tables: any[];
+  field_candidates: LosslessFieldCandidate[];
+  mapped_fields: Record<string, any>;
+  unmapped_fields: LosslessFieldCandidate[];
+  orphan_values: any[];
+  uncertain_tokens: any[];
+  review_required: boolean;
+}
+
+export interface LosslessDocumentResult {
+  success: boolean;
+  schema: "lossless_document_v1";
+  source_path?: string;
+  pages: LosslessPage[];
+  finalJson: Record<string, any>;
+  costBreakdown?: CostBreakdownEntry[];
+  review_required: boolean;
+  quality_gate: { passed: boolean; reason?: string };
+  stats: {
+    totalApiCalls: number;
+    totalTokens: number;
+    elapsedMs: number;
+    pageCount: number;
+  };
+  errors?: string[];
+}
+
 export interface LayeredExtractionConfig {
   primaryModel: string;
   ocrModel: string;
@@ -150,6 +199,10 @@ export interface LayeredExtractionConfig {
   maxUnverifiedRequiredFields?: number;
   /** v11: Return routing/cost evidence */
   returnCostBreakdown?: boolean;
+  /** v11: Preserve all visible text/fields even when requested fields are supplied */
+  preserveAll?: boolean;
+  /** v11: Structured lossless output schema identifier */
+  outputSchema?: "lossless_document_v1";
   /** Internal test seam: lets focused tests exercise routing without network/API keys */
   primaryProviderOverride?: VisionProvider;
   /** Internal test seam: lets focused tests exercise OCR fallback without network/API keys */

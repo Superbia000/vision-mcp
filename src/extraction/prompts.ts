@@ -179,7 +179,7 @@ export function buildFieldExtractionPrompt(
     return `- ${parts.join("; ")}`;
   }).join("\n");
 
-  prompt += `\n\n請只抽取 requested_fields 內列出的欄位，並且每個欄位都輸出一次：\n${lines}`;
+  prompt += `\n\n先完整讀取並保留整頁所有可見資料，再把以下 requested_fields 映射到最可能的欄位；不要因 requested_fields 而忽略其他欄位：\n${lines || "- 無 requested_fields：請自動發現所有欄位"}`;
   prompt += `\n\n欄位輸出規則：`;
   prompt += `\n- 每個輸出物件的 "name" 必須完全等於 requested_fields 的 name。`;
   prompt += `\n- "label" 寫文件中實際看見的標籤；"value" 只寫該欄位要求的值，不要寫解釋。`;
@@ -191,4 +191,57 @@ export function buildFieldExtractionPrompt(
   prompt += `\n{ "fields": [ { "name": "requested_name", "label": "visible label", "value": "exact visible value", "confidence": "high|medium|low" } ] }`;
 
   return prompt;
+}
+
+/**
+ * v11 lossless prompt.
+ * The model must preserve all visible content first, then map requested fields
+ * as a derived view. Unknown labels and orphan values are first-class output.
+ */
+export function buildLosslessDocumentPrompt(
+  docType: DocumentType,
+  fieldSpecs: FieldPromptSpec[] = [],
+  pageNumber?: number
+): string {
+  const requested = fieldSpecs.map((f) => {
+    const parts = [
+      `name="${f.name}"`,
+      `label_aliases="${f.labelPattern || f.name}"`,
+    ];
+    if (f.formatHint) parts.push(`return_value_shape="${f.formatHint}"`);
+    if (f.example) parts.push(`example="${f.example}"`);
+    if (f.allowedValues?.length) parts.push(`allowed_values="${f.allowedValues.join("|")}"`);
+    if (f.contextRule) parts.push(`context_rule="${f.contextRule}"`);
+    return `- ${parts.join("; ")}`;
+  }).join("\n");
+
+  return `${getReadingPrompt(docType)}
+
+你現在執行 lossless_document_v1 文件解析。核心要求：
+- 必須保留整頁所有可見文字、數字、表格、標籤、未知欄位和孤立數據。
+- requested_fields 只用於把已讀到的內容映射到指定欄位；不能因為 requested_fields 未列出而丟棄其他資料。
+- 無法判斷欄位名稱時，保留到 unmapped_fields；只有值沒有明確標籤時，保留到 orphan_values。
+- 模糊字元使用 [?]，不要根據文件類型或上下文補全。
+- bbox 使用 Qwen 0-999 normalized coordinates，格式為 { "x1": number, "y1": number, "x2": number, "y2": number }；看不準 bbox 可以省略，但文字和值不能省略。
+- 表格逐列逐格保留；無法判斷表頭時也要保留 cell 文字。
+
+requested_fields:
+${requested || "- 無。請自動發現所有欄位，不要輸出空殼欄位。"}
+
+返回有效 JSON。JSON keyword required。格式必須是：
+{
+  "schema": "lossless_document_v1",
+  "pages": [{
+    "page": ${pageNumber ?? 1},
+    "raw_markdown": "整頁文字與表格的 markdown，保留換行與順序",
+    "raw_html": "如能可靠保留版面可輸出，否則空字串",
+    "text_items": [{ "text": "逐行或逐詞文字", "bbox": { "x1": 0, "y1": 0, "x2": 999, "y2": 999 }, "confidence": "high|medium|low", "source": "full_page" }],
+    "tables": [{ "bbox": { "x1": 0, "y1": 0, "x2": 999, "y2": 999 }, "rows": [["cell text"]] }],
+    "field_candidates": [{ "name": "推測欄位名或空字串", "label": "文件上實際標籤", "value": "實際看到的值", "bbox": { "x1": 0, "y1": 0, "x2": 999, "y2": 999 }, "confidence": "high|medium|low", "source": "full_page", "needs_review": false }],
+    "mapped_fields": { "requested_name": { "value": "映射到 requested field 的值", "label": "visible label", "confidence": "high|medium|low", "candidates": [] } },
+    "unmapped_fields": [{ "label": "未知或未要求的標籤", "value": "值", "confidence": "high|medium|low" }],
+    "orphan_values": [{ "value": "沒有明確標籤但可見的數據", "bbox": { "x1": 0, "y1": 0, "x2": 999, "y2": 999 }, "confidence": "high|medium|low" }],
+    "uncertain_tokens": [{ "text": "[?]", "context": "周邊文字", "bbox": { "x1": 0, "y1": 0, "x2": 999, "y2": 999 } }]
+  }]
+}`;
 }

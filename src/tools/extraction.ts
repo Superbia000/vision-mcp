@@ -22,6 +22,7 @@ import {
   preprocessHandwriting, detectDocumentType,
 } from "../preprocessing/pipeline.js";
 import { layeredExtract } from "../extraction/layered.js";
+import { extractLosslessDocument, toFieldSpecs } from "../extraction/lossless.js";
 import { decideStrategy } from "../extraction/router.js";
 import { extToMime, isImageExt } from "../utils/helpers.js";
 import { enhancePrompt } from "./helpers.js";
@@ -94,11 +95,11 @@ export async function handleExtractFields(
   const cachePolicy = args.cache_policy as LayeredExtractionConfig["cachePolicy"] | undefined;
 
   if (!path) return JSON.stringify({ error: "image_path required" });
-  if (!rawFields || !rawFields.length) return JSON.stringify({ error: "fields required" });
 
   try {
     let imageBuf: Buffer = readFileSync(path);
     let imageMime = extToMime(extname(path).toLowerCase());
+    const preserveAll = args.preserve_all !== false;
 
     // v8.1: Detect document type BEFORE preprocessing for routing
     const docDetection = await detectDocumentType(imageBuf);
@@ -106,6 +107,20 @@ export async function handleExtractFields(
     console.error(`[extract-fields] Detected document type: ${detectedDocType}`);
     const forcedStrategy = args.strategy as string | undefined;
     const routeDecision = decideStrategy(detectedDocType, forcedStrategy);
+
+    if (preserveAll || !rawFields?.length) {
+      const result = await extractLosslessDocument(provider, imageBuf, imageMime, rawFields, {
+        sourcePath: path,
+        docType: detectedDocType,
+        preserveAll,
+        maxTokens: args.max_tokens,
+        returnCostBreakdown: args.return_cost_breakdown !== false,
+        maxUnverifiedRequiredFields: typeof args.max_unverified_required_fields === "number" ? args.max_unverified_required_fields : undefined,
+        costPolicy: args.cost_policy,
+        cachePolicy: args.cache_policy,
+      });
+      return JSON.stringify(result, null, 2);
+    }
 
     if (doPreprocess && routeDecision.strategy !== "full-page") {
       const pp = await preprocessForOCR(imageBuf, {
@@ -121,16 +136,7 @@ export async function handleExtractFields(
       console.error("[extract-fields] Skipping generic preprocessing for full-page route");
     }
 
-    const fieldSpecs: FieldSpec[] = rawFields.map((f: any) => ({
-      name: f.name || "",
-      labelPattern: f.label_pattern || f.labelPattern || f.name || "",
-      positionHint: f.position_hint || f.positionHint || undefined,
-      formatHint: f.format_hint || f.formatHint || undefined,
-      example: f.example || undefined,
-      allowedValues: f.allowed_values || f.allowedValues || undefined,
-      contextRule: f.context_rule || f.contextRule || undefined,
-      required: f.required !== false,
-    }));
+    const fieldSpecs: FieldSpec[] = toFieldSpecs(rawFields);
 
     const config: LayeredExtractionConfig = {
       primaryModel: MODEL,

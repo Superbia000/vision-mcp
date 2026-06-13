@@ -17,8 +17,8 @@ import { optimizeForVision } from "../rendering/image.js";
 import { retryWithBackoff } from "../utils/retry.js";
 import { parsePageRange, chunkArray, isDocExtractionPrompt, isHandwritingPrompt, isFieldExtractionPrompt } from "../utils/helpers.js";
 import { packImagesByTokenBudget } from "../utils/tokens.js";
-import { layeredSinglePage } from "./helpers.js";
 import { enhancePrompt } from "./helpers.js";
+import { extractLosslessDocument } from "../extraction/lossless.js";
 
 export async function handleAnalyzePdf(
   provider: VisionProvider,
@@ -178,8 +178,17 @@ async function handleConcurrentStrategy(
         try {
           const res = rawFields
             ? await retryWithBackoff(
-                () => layeredSinglePage(x.buffer, x.mime, x.page, rawFields, mt, scVotes || 3, extractionOptions),
-                `Page ${x.page} (layered)`
+                () => extractLosslessDocument(provider, x.buffer, x.mime, rawFields, {
+                  page: x.page,
+                  sourcePath: path,
+                  maxTokens: mt,
+                  vlHighResolutionImages: vlHighRes,
+                  returnCostBreakdown: extractionOptions.return_cost_breakdown !== false,
+                  maxUnverifiedRequiredFields: extractionOptions.max_unverified_required_fields,
+                  costPolicy: extractionOptions.cost_policy,
+                  cachePolicy: extractionOptions.cache_policy,
+                }),
+                `Page ${x.page} (lossless)`
               )
             : await retryWithBackoff(
                 () =>
@@ -206,9 +215,9 @@ async function handleConcurrentStrategy(
                 `Page ${x.page}`
               );
 
-          if (rawFields) {
+          if (rawFields !== undefined) {
             const lr = res as any;
-            return { page: x.page, success: true, text: JSON.stringify(lr.finalJson), reasoning: lr.layout?.reasoning } as PageResult;
+            return { page: x.page, success: true, text: JSON.stringify(lr), reasoning: undefined, input_tokens: lr.costBreakdown?.[0]?.input_tokens, output_tokens: lr.costBreakdown?.[0]?.output_tokens } as PageResult;
           }
           const vr = res as any;
           return { page: x.page, success: true, text: vr.text, reasoning: vr.reasoning, input_tokens: vr.it, output_tokens: vr.ot } as PageResult;
@@ -235,8 +244,9 @@ async function handleConcurrentStrategy(
     strategy: "concurrent",
     pipeline: {
       preprocessing: ENABLE_PREPROCESSING,
-      layered_extraction: !!rawFields,
-      structured_output: !!rawFields,
+      layered_extraction: rawFields !== undefined,
+      structured_output: rawFields !== undefined,
+      lossless_extraction: rawFields !== undefined,
     },
     requested: nums.length,
     successful: ok,
@@ -320,12 +330,29 @@ async function handleMultiImageStrategy(
         const pageRange = pack.length === 1 ? `Page ${pack[0].page}` : `Pages ${pack[0].page}-${pack[pack.length - 1].page}`;
         console.error(`[analyze_pdf] Pack ${ci + 1}/${packs.length}: ${pageRange} (${pack.length} images)`);
         try {
-          if (rawFields) {
-            const res = await retryWithBackoff(
-              () => layeredSinglePage(pack[0].buffer, pack[0].mime, pack[0].page, rawFields, mt, scVotes || 3, extractionOptions),
-              `Pack ${ci + 1} (layered)`
-            );
-            return [{ page: pack[0].page, success: true, text: JSON.stringify((res as any).finalJson), reasoning: (res as any).layout?.reasoning } as PageResult];
+          if (rawFields !== undefined) {
+            const pageResults = await Promise.all(pack.map((p) =>
+              retryWithBackoff(
+                () => extractLosslessDocument(provider, p.buffer, p.mime, rawFields, {
+                  page: p.page,
+                  sourcePath: path,
+                  maxTokens: mt,
+                  vlHighResolutionImages: vlHighRes,
+                  returnCostBreakdown: extractionOptions.return_cost_breakdown !== false,
+                  maxUnverifiedRequiredFields: extractionOptions.max_unverified_required_fields,
+                  costPolicy: extractionOptions.cost_policy,
+                  cachePolicy: extractionOptions.cache_policy,
+                }),
+                `Page ${p.page} (lossless)`
+              ).then((res: any) => ({
+                page: p.page,
+                success: true,
+                text: JSON.stringify(res),
+                input_tokens: res.costBreakdown?.[0]?.input_tokens,
+                output_tokens: res.costBreakdown?.[0]?.output_tokens,
+              } as PageResult))
+            ));
+            return pageResults;
           }
           const images = pack.map((p) => ({ buf: p.buffer, mime: p.mime }));
           const pageList = pack.map((p) => p.page).join(",");
@@ -377,7 +404,7 @@ async function handleMultiImageStrategy(
         ...(qualityAdjustedM ? { quality_adjusted: true, adjusted_from: imgQualityIn } : {}),
         summary: {
           strategy: budgetLabel,
-          pipeline: { preprocessing: ENABLE_PREPROCESSING, layered_extraction: !!rawFields, structured_output: !!rawFields },
+          pipeline: { preprocessing: ENABLE_PREPROCESSING, layered_extraction: rawFields !== undefined, structured_output: rawFields !== undefined, lossless_extraction: rawFields !== undefined },
           requested: nums.length,
           successful: ok,
           failed: nums.length - ok,

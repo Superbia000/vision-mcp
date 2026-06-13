@@ -23,6 +23,7 @@ import { handleAnalyzeImage } from "./image-analyze.js";
 import { handleAnalyzePdf } from "./pdf-analyze.js";
 import { handleAnalyzeVideo, handleAnalyzeVideoChunked } from "./video.js";
 import { handleExtractFields, handleExtractVerify, handleHandwriting } from "./extraction.js";
+import { aggregateLosslessPages } from "../extraction/lossless.js";
 import { submitBatchedJobs } from "../batch/manager.js";
 import { getPdfPageCount, getPdfType, renderPageSmart } from "../rendering/pdf.js";
 import {
@@ -337,25 +338,26 @@ export class ToolRouter {
     const filePath = args.file_path as string;
     const fields = args.fields as any[] | undefined;
     const missing = this.ensureFile(filePath);
-    if (missing || !fields?.length) {
+    if (missing) {
       return asTextEnvelope(envelope({
         success: false,
         tool: "vision_extract",
         strategy: "validate",
-        errors: [missing, !fields?.length ? "fields required" : undefined].filter(Boolean) as string[],
+        errors: [missing].filter(Boolean) as string[],
       }));
     }
 
     const mediaType = this.mediaType(filePath);
     const policy = resolveAccuracyPolicy(args);
-    const prompt = this.buildFieldPrompt(fields);
+    const prompt = this.buildFieldPrompt(fields || []);
     const { value, elapsedMs } = await timed(async () => {
       if (mediaType === "pdf") {
         const result = await handleAnalyzePdf(this.provider, {
           pdf_path: filePath,
           pages: args.pages || "1",
           prompt,
-          fields,
+          fields: fields || [],
+          lossless_extraction: true,
           strategy: args.strategy,
           max_tokens: args.max_tokens ?? MAX_OUTPUT_TOKENS,
           concurrency: policy.concurrency,
@@ -371,10 +373,12 @@ export class ToolRouter {
           max_unverified_required_fields: args.max_unverified_required_fields,
           ocr_verify: policy.ocrVerify,
         });
-        return this.parseToolJson(result);
+        const parsed = this.parseToolJson(result);
+        if (parsed?.results) return aggregateLosslessPages(parsed.results, fields || [], filePath);
+        return parsed;
       }
       if (mediaType === "image") {
-        if (args.document_type === "handwriting" && fields.length === 1 && /text|hand/i.test(fields[0].name || "")) {
+        if (args.document_type === "handwriting" && fields?.length === 1 && /text|hand/i.test(fields[0].name || "")) {
           return this.parseToolJson(await handleHandwriting(this.provider, {
             image_path: filePath,
             prompt,
@@ -384,6 +388,9 @@ export class ToolRouter {
         return this.parseToolJson(await handleExtractFields(this.provider, {
           image_path: filePath,
           fields,
+          preserve_all: args.preserve_all !== false,
+          output_schema: args.output_schema || "lossless_document_v1",
+          max_tokens: args.max_tokens ?? MAX_OUTPUT_TOKENS,
           use_ocr_model: policy.ocrVerify,
           preprocess: args.preprocess !== false,
           strategy: args.strategy || (args.document_type && args.document_type !== "auto" ? undefined : "auto"),
@@ -425,10 +432,12 @@ export class ToolRouter {
   private buildFieldPrompt(fields: any[]): string {
     const names = fields.map((f) => f.name || f.label_pattern || f.labelPattern).filter(Boolean).join(", ");
     return [
-      "Extract the requested document fields exactly as shown.",
+      "Perform lossless document extraction.",
+      "Preserve every visible text item, table, field candidate, unknown field, and orphan value.",
+      "After preserving all data, map requested fields when provided.",
       "Do not fabricate missing or obscured values. Use [?] for uncertain characters.",
-      "Return structured JSON with value, confidence, and evidence when possible.",
-      `Requested fields: ${names}`,
+      "Return JSON using schema lossless_document_v1.",
+      `Requested fields: ${names || "(none; discover all visible fields)"}`,
     ].join("\n");
   }
 

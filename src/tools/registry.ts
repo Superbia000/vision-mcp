@@ -56,15 +56,18 @@ export const PUBLIC_TOOLS = [
   },
   {
     name: "vision_extract",
-    description: "Structured document field extraction for invoices, forms, tables, handwriting, IDs, and bank/shipping documents with uncertainty review flags.",
+    description: "Lossless document extraction for invoices, forms, tables, handwriting, IDs, and bank/shipping documents. Preserves all visible fields/data before mapping requested fields.",
     inputSchema: {
       type: "object",
       properties: {
         file_path: { type: "string", description: "Absolute path to a PDF or image file." },
-        fields: { type: "array", items: { type: "object" }, description: "Field specs with name, label_pattern, format_hint, position_hint, examples, and validation hints." },
+        fields: { type: "array", items: { type: "object" }, description: "Optional field specs with name, label_pattern, format_hint, position_hint, examples, and validation hints. If omitted, all visible fields are discovered and preserved." },
         pages: { type: "string", description: "PDF page range. Default: page 1." },
         document_type: { type: "string", description: "auto | scan | table | photo | handwriting | mixed." },
         validation_rules: { type: "array", items: { type: "object" } },
+        preserve_all: { type: "boolean", description: "Preserve all visible fields/data, including unmapped fields and orphan values. Default true." },
+        output_schema: { type: "string", description: "lossless_document_v1. Default lossless_document_v1." },
+        enhancement_mode: { type: "string", description: "off | safe | ai-verified. Advisory for low-quality scan preparation; AI enhancement must be A/B verified before adoption." },
         accuracy_mode: { type: "string", description: "fast | balanced | max. Default: balanced." },
         ocr_verify: { type: "boolean", description: "Enable OCR verification for uncertain fields. Default true except fast mode." },
         self_consistency_votes: { type: "number" },
@@ -75,7 +78,7 @@ export const PUBLIC_TOOLS = [
         budget_hint_usd: { type: "number", description: "Advisory cost hint only; does not cap quality checks." },
         max_unverified_required_fields: { type: "number", description: "Default 0. Mark result as review-needed if required fields remain unverified." },
       },
-      required: ["file_path", "fields"],
+      required: ["file_path"],
     },
   },
   {
