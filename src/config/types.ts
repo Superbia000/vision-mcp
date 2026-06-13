@@ -60,6 +60,7 @@ export interface ProcessingSummary {
   total_input_tokens?: number;
   total_output_tokens?: number;
   concurrency?: number;
+  render_concurrency?: number;
 }
 
 export interface BatchResult {
@@ -164,6 +165,16 @@ export interface LosslessDocumentResult {
   source_path?: string;
   pages: LosslessPage[];
   finalJson: Record<string, any>;
+  universal_schema?: "universal_document_semantics_v1";
+  extraction_policy?: Record<string, any>;
+  raw_pages?: any[];
+  semantic_pages?: any[];
+  detected_documents?: any[];
+  entities?: any[];
+  relationships?: any[];
+  integrated_records?: any[];
+  review_issues?: any[];
+  artifacts?: any[];
   modelExtractedFields?: Record<string, any>;
   fieldEvidence?: Record<string, any>;
   reviewRequiredFields?: any[];

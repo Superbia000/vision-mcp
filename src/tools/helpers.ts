@@ -86,7 +86,7 @@ export async function layeredSinglePage(
     example: f.example || undefined,
     allowedValues: f.allowed_values || f.allowedValues || undefined,
     contextRule: f.context_rule || f.contextRule || undefined,
-    required: f.required !== false,
+    required: f.required === true,
   }));
 
   const config: LayeredExtractionConfig = {

@@ -29,6 +29,7 @@ export async function handleAnalyzePdf(
   const prompt = args.prompt as string;
   const mt = (args.max_tokens as number) ?? 4096;
   const concurrency = (args.concurrency as number) ?? CONCURRENCY;
+  const renderConcurrency = (args.render_concurrency as number) || concurrency;
   const imgQuality = (args.image_quality as number) || (isDocExtractionPrompt(prompt) ? WEBP_QUALITY_OCR : WEBP_QUALITY);
   const imgMaxWidth = (args.max_image_width as number) ?? MAX_IMAGE_WIDTH;
   const enableThinking = args.enable_thinking as boolean | undefined;
@@ -55,6 +56,17 @@ export async function handleAnalyzePdf(
     verification_mode: args.verification_mode,
     return_evidence: args.return_evidence,
     return_quality_report: args.return_quality_report,
+    attention_fields: args.attention_fields,
+    attention_rules: args.attention_rules,
+    domain_hint: args.domain_hint,
+    semantic_mode: args.semantic_mode,
+    output_grain: args.output_grain,
+    integration_mode: args.integration_mode,
+    extract_all_fields: args.extract_all_fields,
+    render_scale: renderScale,
+    max_api_concurrency: args.max_api_concurrency,
+    render_concurrency: renderConcurrency,
+    writer_mode: args.writer_mode,
   };
 
   if (!path) return { content: [{ type: "text", text: "Error: pdf_path required" }] };
@@ -78,10 +90,10 @@ export async function handleAnalyzePdf(
       return handleBatchStrategy(provider, path, nums, enhancedPrompt, mt, imgQuality, imgMaxWidth, enableThinking, thinkingBudget, { renderScale, maxPixels, minPixels, losslessMode });
 
     case "multi-image":
-      return handleMultiImageStrategy(provider, path, nums, enhancedPrompt, mt, concurrency, imgQuality, imgMaxWidth, enableThinking, thinkingBudget, vlHighRes, maxPixels, minPixels, temperature, topP, chunkSizeOverride, rawFields, scVotes, extractionOptions, { renderScale, losslessMode });
+      return handleMultiImageStrategy(provider, path, nums, enhancedPrompt, mt, concurrency, renderConcurrency, imgQuality, imgMaxWidth, enableThinking, thinkingBudget, vlHighRes, maxPixels, minPixels, temperature, topP, chunkSizeOverride, rawFields, scVotes, extractionOptions, { renderScale, losslessMode });
 
     case "concurrent":
-      return handleConcurrentStrategy(provider, path, nums, enhancedPrompt, mt, concurrency, imgQuality, imgMaxWidth, enableThinking, thinkingBudget, vlHighRes, maxPixels, minPixels, temperature, topP, rawFields, scVotes, extractionOptions, { renderScale, losslessMode });
+      return handleConcurrentStrategy(provider, path, nums, enhancedPrompt, mt, concurrency, renderConcurrency, imgQuality, imgMaxWidth, enableThinking, thinkingBudget, vlHighRes, maxPixels, minPixels, temperature, topP, rawFields, scVotes, extractionOptions, { renderScale, losslessMode });
 
     default:
       return { content: [{ type: "text", text: `Error: Unknown strategy: ${strategy}` }] };
@@ -139,6 +151,7 @@ async function handleConcurrentStrategy(
   prompt: string,
   mt: number,
   concurrency: number,
+  renderConcurrency: number,
   imgQualityIn: number,
   imgMaxWidth: number,
   enableThinking?: boolean,
@@ -157,9 +170,10 @@ async function handleConcurrentStrategy(
     return { content: [{ type: "text" as const, text: `Error: Too many pages (${nums.length}) for concurrent strategy. Use strategy=multi-image or strategy=batch.` }] };
   }
 
-  const limit = pLimit(concurrency);
+  const apiLimit = pLimit(concurrency);
+  const renderLimit = pLimit(renderConcurrency);
   const tStart = Date.now();
-  console.error(`[analyze_pdf] Processing ${nums.length} pages (concurrency=${concurrency})...`);
+  console.error(`[analyze_pdf] Processing ${nums.length} pages (api_concurrency=${concurrency}, render_concurrency=${renderConcurrency})...`);
 
   const enhancedPrompt = enhancePrompt(prompt);
 
@@ -175,7 +189,7 @@ async function handleConcurrentStrategy(
       : ENABLE_PREPROCESSING;
   const prepared = await Promise.all(
     nums.map((pn) =>
-      limit(async () => {
+      renderLimit(async () => {
         try {
           const img = await renderPageSmart(path, pn, imgMaxWidth, applyGenericPreprocess, isHandwritingPrompt(prompt), !PREPROCESS_WITH_THINKING && (enableThinking ?? false), {
             renderScale: renderOptions.renderScale,
@@ -195,7 +209,7 @@ async function handleConcurrentStrategy(
   const visionTasks = prepared
     .filter((x) => !x.error)
     .map((x) =>
-      limit(async () => {
+      apiLimit(async () => {
         try {
           const res = rawFields
             ? await retryWithBackoff(
@@ -215,6 +229,13 @@ async function handleConcurrentStrategy(
                   verificationMode: extractionOptions.verification_mode,
                   returnEvidence: extractionOptions.return_evidence,
                   returnQualityReport: extractionOptions.return_quality_report,
+                  attentionFields: extractionOptions.attention_fields,
+                  attentionRules: extractionOptions.attention_rules,
+                  domainHint: extractionOptions.domain_hint,
+                  semanticMode: extractionOptions.semantic_mode,
+                  outputGrain: extractionOptions.output_grain,
+                  integrationMode: extractionOptions.integration_mode,
+                  extractAllFields: extractionOptions.extract_all_fields,
                 }),
                 `Page ${x.page} (lossless)`
               )
@@ -283,6 +304,7 @@ async function handleConcurrentStrategy(
     total_output_tokens: to,
     elapsed_seconds: parseFloat(elapsed),
     concurrency,
+    render_concurrency: renderConcurrency,
   };
 
   return {
@@ -303,6 +325,7 @@ async function handleMultiImageStrategy(
   prompt: string,
   mt: number,
   concurrency: number,
+  renderConcurrency: number,
   imgQualityIn: number,
   imgMaxWidth: number,
   enableThinking?: boolean,
@@ -318,7 +341,8 @@ async function handleMultiImageStrategy(
   extractionOptions: Record<string, any> = {},
   renderOptions: { renderScale?: number; losslessMode?: boolean } = {}
 ) {
-  const limit = pLimit(concurrency);
+  const apiLimit = pLimit(concurrency);
+  const renderLimit = pLimit(renderConcurrency);
   const tStart = Date.now();
 
   // v8.2: quality guard
@@ -334,7 +358,7 @@ async function handleMultiImageStrategy(
       : ENABLE_PREPROCESSING;
   const preparedAll = await Promise.all(
     nums.map((pn) =>
-      limit(async () => {
+      renderLimit(async () => {
         try {
           const img = await renderPageSmart(path, pn, imgMaxWidth, applyGenericPreprocess, isHandwritingPrompt(prompt), !PREPROCESS_WITH_THINKING && (enableThinking ?? false), {
             renderScale: renderOptions.renderScale,
@@ -363,7 +387,7 @@ async function handleMultiImageStrategy(
   // Process each pack
   const allResults = await Promise.all(
     packs.map((pack, ci) =>
-      limit(async () => {
+      apiLimit(async () => {
         const pageRange = pack.length === 1 ? `Page ${pack[0].page}` : `Pages ${pack[0].page}-${pack[pack.length - 1].page}`;
         console.error(`[analyze_pdf] Pack ${ci + 1}/${packs.length}: ${pageRange} (${pack.length} images)`);
         try {
@@ -386,6 +410,13 @@ async function handleMultiImageStrategy(
                   verificationMode: extractionOptions.verification_mode,
                   returnEvidence: extractionOptions.return_evidence,
                   returnQualityReport: extractionOptions.return_quality_report,
+                  attentionFields: extractionOptions.attention_fields,
+                  attentionRules: extractionOptions.attention_rules,
+                  domainHint: extractionOptions.domain_hint,
+                  semanticMode: extractionOptions.semantic_mode,
+                  outputGrain: extractionOptions.output_grain,
+                  integrationMode: extractionOptions.integration_mode,
+                  extractAllFields: extractionOptions.extract_all_fields,
                 }),
                 `Page ${p.page} (lossless)`
               ).then((res: any) => ({
@@ -453,6 +484,8 @@ async function handleMultiImageStrategy(
           successful: ok,
           failed: nums.length - ok,
           elapsed_seconds: parseFloat(elapsed),
+          concurrency,
+          render_concurrency: renderConcurrency,
         },
         results: flatResults,
         ...(errs.length ? { errors: errs } : {})

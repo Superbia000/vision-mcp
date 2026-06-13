@@ -21,6 +21,7 @@ import { detectDocumentType } from "../preprocessing/pipeline.js";
 import { estimateImageTokens, summarizeCost } from "../runtime/cost.js";
 import { buildLosslessDocumentPrompt } from "./prompts.js";
 import { fieldValueLooksValid } from "./router.js";
+import { buildUniversalSemanticResult, type SemanticOptions } from "./semantic.js";
 
 type Confidence = "high" | "medium" | "low";
 
@@ -42,6 +43,13 @@ export interface LosslessExtractOptions {
   verificationMode?: "off" | "strict";
   returnEvidence?: boolean;
   returnQualityReport?: boolean;
+  attentionFields?: any[];
+  attentionRules?: any[];
+  domainHint?: string;
+  semanticMode?: string;
+  outputGrain?: string;
+  integrationMode?: string;
+  extractAllFields?: boolean;
 }
 
 export function toFieldSpecs(rawFields?: any[]): FieldSpec[] {
@@ -53,7 +61,7 @@ export function toFieldSpecs(rawFields?: any[]): FieldSpec[] {
     example: f.example || undefined,
     allowedValues: f.allowed_values || f.allowedValues || undefined,
     contextRule: f.context_rule || f.contextRule || undefined,
-    required: f.required !== false,
+    required: f.required === true,
   })).filter((f) => f.name || f.labelPattern);
 }
 
@@ -806,7 +814,8 @@ function toCostEntry(
 export function aggregateLosslessPages(
   pageResults: any[],
   rawFields?: any[],
-  sourcePath?: string
+  sourcePath?: string,
+  semanticOptions: SemanticOptions = {}
 ): LosslessDocumentResult {
   const started = Date.now();
   const fieldSpecs = toFieldSpecs(rawFields);
@@ -842,7 +851,7 @@ export function aggregateLosslessPages(
 
   pages.sort((a, b) => a.page - b.page);
   const qualityGate = buildQualityGate(pages, fieldSpecs, 0);
-  return {
+  const result: LosslessDocumentResult = {
     success: qualityGate.passed && errors.length === 0,
     schema: "lossless_document_v1",
     source_path: sourcePath,
@@ -870,6 +879,7 @@ export function aggregateLosslessPages(
     },
     errors: errors.length ? errors : undefined,
   };
+  return buildUniversalSemanticResult(result, { ...semanticOptions, sourcePath });
 }
 
 function normalizeLosslessPage(parsed: any, fieldSpecs: FieldSpec[], pageNumber: number): LosslessPage {

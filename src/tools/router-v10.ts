@@ -24,6 +24,7 @@ import { handleAnalyzePdf } from "./pdf-analyze.js";
 import { handleAnalyzeVideo, handleAnalyzeVideoChunked } from "./video.js";
 import { handleExtractFields, handleExtractVerify, handleHandwriting } from "./extraction.js";
 import { aggregateLosslessPages } from "../extraction/lossless.js";
+import { buildUniversalSemanticResult } from "../extraction/semantic.js";
 import { submitBatchedJobs } from "../batch/manager.js";
 import { getPdfPageCount, getPdfType, renderPageSmart } from "../rendering/pdf.js";
 import {
@@ -364,6 +365,8 @@ export class ToolRouter {
       pages: args.pages || "",
       max_tokens: args.max_tokens ?? MAX_OUTPUT_TOKENS,
       concurrency: policy.concurrency,
+      max_api_concurrency: args.max_api_concurrency,
+      render_concurrency: args.render_concurrency,
       chunk_size: args.chunk_size,
       image_quality: policy.imageQuality,
         max_image_width: args.max_image_width ?? MAX_IMAGE_WIDTH,
@@ -431,18 +434,22 @@ export class ToolRouter {
 
     const mediaType = this.mediaType(filePath);
     const policy = resolveAccuracyPolicy(args);
-    const prompt = this.buildFieldPrompt(fields || []);
+    const attentionFields = this.normalizeAttentionFields(args.attention_fields, fields);
+    const extractionFields = fields?.length ? fields : attentionFields;
+    const prompt = this.buildFieldPrompt(extractionFields || [], args);
     const { value, elapsedMs } = await timed(async () => {
       if (mediaType === "pdf") {
         const result = await handleAnalyzePdf(this.provider, {
           pdf_path: filePath,
           pages: args.pages || "1",
           prompt,
-          fields: fields || [],
+          fields: extractionFields || [],
           lossless_extraction: true,
           strategy: args.strategy,
           max_tokens: args.max_tokens ?? MAX_OUTPUT_TOKENS,
           concurrency: policy.concurrency,
+          max_api_concurrency: args.max_api_concurrency,
+          render_concurrency: args.render_concurrency,
           image_quality: policy.imageQuality,
           max_image_width: args.max_image_width ?? MAX_IMAGE_WIDTH,
           max_pixels: args.max_pixels,
@@ -463,9 +470,31 @@ export class ToolRouter {
           verification_mode: args.verification_mode || "strict",
           return_evidence: args.return_evidence !== false,
           return_quality_report: args.return_quality_report !== false,
+          attention_fields: attentionFields,
+          attention_rules: args.attention_rules,
+          domain_hint: args.domain_hint || "auto",
+          semantic_mode: args.semantic_mode || "auto",
+          output_grain: args.output_grain || "auto",
+          integration_mode: args.integration_mode || "none",
+          extract_all_fields: args.extract_all_fields !== false,
+          writer_mode: args.writer_mode,
         });
         const parsed = this.parseToolJson(result);
-        if (parsed?.results) return aggregateLosslessPages(parsed.results, fields || [], filePath);
+        if (parsed?.results) {
+          return aggregateLosslessPages(parsed.results, extractionFields || [], filePath, {
+            attentionFields,
+            attentionRules: args.attention_rules,
+            domainHint: args.domain_hint || "auto",
+            semanticMode: args.semantic_mode || "auto",
+            outputGrain: args.output_grain || "auto",
+            integrationMode: args.integration_mode || "none",
+            extractAllFields: args.extract_all_fields !== false,
+            renderScale: args.render_scale,
+            maxApiConcurrency: args.max_api_concurrency ?? policy.concurrency,
+            renderConcurrency: args.render_concurrency,
+            writerMode: args.writer_mode,
+          });
+        }
         return parsed;
       }
       if (mediaType === "image") {
@@ -476,9 +505,9 @@ export class ToolRouter {
             language_hint: args.language_hint,
           }));
         }
-        return this.parseToolJson(await handleExtractFields(this.provider, {
+        const imageResult = this.parseToolJson(await handleExtractFields(this.provider, {
           image_path: filePath,
-          fields,
+          fields: extractionFields,
           preserve_all: args.preserve_all !== false,
           output_schema: args.output_schema || "lossless_document_v1",
           max_tokens: args.max_tokens ?? MAX_OUTPUT_TOKENS,
@@ -498,6 +527,22 @@ export class ToolRouter {
           return_evidence: args.return_evidence !== false,
           return_quality_report: args.return_quality_report !== false,
         }));
+        return imageResult?.schema === "lossless_document_v1"
+          ? buildUniversalSemanticResult(imageResult, {
+              sourcePath: filePath,
+              attentionFields,
+              attentionRules: args.attention_rules,
+              domainHint: args.domain_hint || "auto",
+              semanticMode: args.semantic_mode || "auto",
+              outputGrain: args.output_grain || "auto",
+              integrationMode: args.integration_mode || "none",
+              extractAllFields: args.extract_all_fields !== false,
+              renderScale: args.render_scale,
+              maxApiConcurrency: args.max_api_concurrency ?? policy.concurrency,
+              renderConcurrency: args.render_concurrency,
+              writerMode: args.writer_mode,
+            })
+          : imageResult;
       }
       return { error: `Unsupported extraction file type: ${extname(filePath)}` };
     });
@@ -548,15 +593,28 @@ export class ToolRouter {
     }));
   }
 
-  private buildFieldPrompt(fields: any[]): string {
+  private normalizeAttentionFields(rawAttention: any, legacyFields?: any[]): any[] {
+    const attention = Array.isArray(rawAttention) ? rawAttention : [];
+    const legacy = Array.isArray(legacyFields) ? legacyFields : [];
+    return [...attention, ...legacy].map((field) => {
+      if (typeof field === "string") return { name: field, required: false };
+      return { ...field, required: field?.required === true };
+    }).filter((field) => typeof field === "string" ? field.trim() : (field?.name || field?.label || field?.field));
+  }
+
+  private buildFieldPrompt(fields: any[], args: any = {}): string {
     const names = fields.map((f) => f.name || f.label_pattern || f.labelPattern).filter(Boolean).join(", ");
     return [
-      "Extract visible document data using model-first OCR.",
+      "Extract visible document data using model-first OCR and universal document understanding.",
+      "Attention/requested fields are hints for extra checking, not a whitelist.",
+      "Always discover and preserve all visible fields, tables, entities, unmapped fields, and orphan values.",
       "Return null for absent, unreadable, or uncertain values.",
       "Do not infer, complete, or fabricate values.",
       "Keep evidence/confidence metadata when available.",
+      args.domain_hint ? `Domain hint: ${args.domain_hint}` : "",
+      args.attention_rules ? `Attention rules: ${JSON.stringify(args.attention_rules)}` : "",
       `Requested fields: ${names || "(none; discover all visible fields)"}`,
-    ].join("\n");
+    ].filter(Boolean).join("\n");
   }
 
   private async visionJobs(args: any): Promise<ToolResult> {
