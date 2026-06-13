@@ -19,7 +19,7 @@ import sharp from "sharp";
 import type { PreprocessOptions, PreprocessResult, DocumentType } from "../config/types.js";
 import {
   ENABLE_EDGE_ENHANCE, ENABLE_ADAPTIVE_THRESHOLD,
-  ENABLE_PERSPECTIVE_CORRECT, MIN_PDF_DPI,
+  ENABLE_PERSPECTIVE_CORRECT,
 } from "../config/constants.js";
 
 // ---------- Negative/Inverted image detection ----------
@@ -163,7 +163,6 @@ export async function preprocessForOCR(
     enhanceContrast: options.enhanceContrast ?? true,
     sharpen: options.sharpen ?? true,
     grayscale: options.grayscale ?? true,
-    targetDpi: options.targetDpi ?? 0,
     removeBackground: options.removeBackground ?? true,
     quality: options.quality ?? 95,
     docType: options.docType ?? "scan",
@@ -294,19 +293,6 @@ export async function preprocessForOCR(
       .toBuffer();
     pipeline = sharp(thresh);
     steps.push("adaptive-threshold");
-  }
-
-  // Optional DPI-based resize
-  if (opts.targetDpi > 0 && meta.width && meta.height) {
-    const currentDpi = meta.density ?? 72;
-    const effectiveDpi = currentDpi > 0 ? currentDpi : 72;
-    const targetDpi = Math.max(opts.targetDpi, MIN_PDF_DPI);
-    const scale = targetDpi / effectiveDpi;
-    if (scale > 1.0) {
-      const newW = Math.round(meta.width * scale);
-      pipeline = pipeline.resize({ width: newW, withoutEnlargement: false });
-      steps.push(`resize-${targetDpi}dpi(from ${Math.round(effectiveDpi)})`);
-    }
   }
 
   const resultBuf = await pipeline.png({ quality: opts.quality }).toBuffer();

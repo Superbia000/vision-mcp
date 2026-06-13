@@ -14,6 +14,7 @@ import {
   IMAGE_MAX_BYTES,
   IMAGE_COMPRESSION_FALLBACK,
   IMAGE_JPEG_QUALITY,
+  LOSSLESS_MODE,
   WEBP_QUALITY,
 } from "../config/constants.js";
 
@@ -70,7 +71,7 @@ export async function optimizeForVision(
 
   // Step 2: Decide format strategy (v8.3)
   const shouldUseLossless =
-    (isImageBasedPdf && IMAGE_PDF_LOSSLESS) || preferLossless;
+    LOSSLESS_MODE || (isImageBasedPdf && IMAGE_PDF_LOSSLESS) || preferLossless;
 
   if (shouldUseLossless) {
     // PNG lossless path
@@ -81,18 +82,14 @@ export async function optimizeForVision(
     const pngBuf = await pipeline.png().toBuffer();
     const pngSizeMB = pngBuf.length / (1024 * 1024);
 
-    if (pngSizeMB < maxBytes / (1024 * 1024)) {
-      console.error(
-        `[image] PNG lossless (image-based PDF): ${(img.buffer.length / 1024).toFixed(0)}KB -> ${(pngBuf.length / 1024).toFixed(0)}KB ` +
-        `(${targetW}x${Math.round(targetW * (img.height / img.width))})`
-      );
-      return { buffer: pngBuf, mime: "image/png" };
-    }
-
-    // PNG too large → fallback to compression
     console.error(
-      `[image] PNG exceeds ${(maxBytes / 1024 / 1024).toFixed(1)}MB limit, falling back to ${IMAGE_COMPRESSION_FALLBACK}`
+      `[image] PNG lossless: ${(img.buffer.length / 1024).toFixed(0)}KB -> ${(pngBuf.length / 1024).toFixed(0)}KB ` +
+      `(${targetW}x${Math.round(targetW * (img.height / img.width))})`
     );
+    if (pngSizeMB >= maxBytes / (1024 * 1024)) {
+      console.error(`[image] PNG exceeds ${(maxBytes / 1024 / 1024).toFixed(1)}MB limit; keeping PNG because lossless_mode is enabled`);
+    }
+    return { buffer: pngBuf, mime: "image/png" };
   }
 
   // Step 3: Compression path (legacy WebP or JPEG fallback)

@@ -35,7 +35,7 @@ import {
   preprocessScanned,
   preprocessTable,
 } from "../preprocessing/pipeline.js";
-import { extToMime, isImageExt, isVideoExt, parsePageRange } from "../utils/helpers.js";
+import { extToMime, isImageExt, isVideoExt, parsePageRangeDetailed } from "../utils/helpers.js";
 import { optimizeForVision } from "../rendering/image.js";
 
 type ToolResult = { content: { type: "text"; text: string }[] };
@@ -139,6 +139,9 @@ export class ToolRouter {
           file_path: filePath,
           pages: args.pages || "1",
           max_image_width: args.max_image_width ?? MAX_IMAGE_WIDTH,
+          max_pixels: args.max_pixels,
+          render_scale: args.render_scale,
+          lossless_mode: args.lossless_mode !== false,
         }));
         estimates.pdf_type = getPdfType(filePath) || "unknown";
       } else {
@@ -146,6 +149,9 @@ export class ToolRouter {
           file_path: filePath,
           pages: args.pages || "1",
           max_image_width: args.max_image_width ?? MAX_IMAGE_WIDTH,
+          max_pixels: args.max_pixels,
+          render_scale: args.render_scale,
+          lossless_mode: args.lossless_mode !== false,
           fps: args.fps,
         }));
         if (mediaType === "image") {
@@ -203,10 +209,16 @@ export class ToolRouter {
     const { value, elapsedMs } = await timed(async () => {
       if (mediaType === "pdf") {
         const total = await getPdfPageCount(filePath);
-        const nums = args.pages ? parsePageRange(args.pages, total) : [1];
+        const parsedPages = args.pages ? parsePageRangeDetailed(args.pages, total) : { pages: [1] };
+        if (parsedPages.error) return { error: parsedPages.error };
+        const nums = parsedPages.pages;
         const rendered = [];
         for (const pn of nums) {
-          const img = await renderPageSmart(filePath, pn, MAX_IMAGE_WIDTH, true, mode === "handwriting");
+          const img = await renderPageSmart(filePath, pn, args.max_image_width ?? MAX_IMAGE_WIDTH, true, mode === "handwriting", false, {
+            renderScale: args.render_scale,
+            maxPixels: args.max_pixels,
+            losslessMode: args.lossless_mode !== false,
+          });
           const outPath = this.resolveOutputPath(args.output_path, filePath, pn, "png");
           if (outPath) writeFileSync(outPath, img.buffer);
           rendered.push({
@@ -218,7 +230,29 @@ export class ToolRouter {
             image_base64: args.return_base64 ? img.buffer.toString("base64") : undefined,
           });
         }
-        return { media_type: "pdf", rendered };
+        const result: any = {
+          media_type: "pdf",
+          lossless_mode: args.lossless_mode !== false,
+          preserve_original: args.preserve_original !== false,
+          rendered,
+        };
+        if (args.return_artifacts || args.preprocess_variants) {
+          result.artifacts = [
+            this.sourceArtifact(filePath, "pdf"),
+            ...rendered.map((item: any) => ({
+              role: "prepared_lossless_png_candidate",
+              page: item.page,
+              mime: item.mime,
+              width: item.width,
+              height: item.height,
+              output_path: item.output_path,
+              derived_from: "trusted_original",
+              lossy: false,
+            })),
+          ];
+          result.preprocess_variants = this.expandPreprocessVariants(args.preprocess_variants);
+        }
+        return result;
       }
 
       if (mediaType !== "image") return { error: `Unsupported prepare file type: ${extname(filePath)}` };
@@ -233,9 +267,11 @@ export class ToolRouter {
                   : await preprocessForOCR(raw);
       const outPath = args.output_path as string | undefined;
       if (outPath) writeFileSync(outPath, Buffer.from(prepared.buffer));
-      return {
+      const result: any = {
         media_type: "image",
         mode,
+        lossless_mode: args.lossless_mode !== false,
+        preserve_original: args.preserve_original !== false,
         width: prepared.width,
         height: prepared.height,
         mime: prepared.mime,
@@ -244,6 +280,24 @@ export class ToolRouter {
         output_path: outPath,
         image_base64: args.return_base64 || !outPath ? Buffer.from(prepared.buffer).toString("base64") : undefined,
       };
+      if (args.return_artifacts || args.preprocess_variants) {
+        result.artifacts = [
+          this.sourceArtifact(filePath, "image"),
+          {
+            role: "preprocess_candidate_png",
+            variant: mode,
+            mime: prepared.mime,
+            width: prepared.width,
+            height: prepared.height,
+            output_path: outPath,
+            derived_from: "trusted_original",
+            lossy: false,
+            steps: prepared.appliedSteps,
+          },
+        ];
+        result.preprocess_variants = this.expandPreprocessVariants(args.preprocess_variants);
+      }
+      return result;
     });
 
     return asTextEnvelope(envelope({
@@ -264,6 +318,30 @@ export class ToolRouter {
     if (parsed.ext) return join(parsed.dir || dirname(inputPath), `${parsed.name}-p${page}${parsed.ext}`);
     const base = parse(inputPath).name;
     return join(outputPath, `${base}-p${page}.${ext}`);
+  }
+
+  private sourceArtifact(filePath: string, mediaType: "pdf" | "image" | "video" | "unknown"): any {
+    return {
+      role: "trusted_original",
+      path: filePath,
+      mime: mediaType === "pdf" ? "application/pdf" : extToMime(extname(filePath).toLowerCase()),
+      preserve_original: true,
+      lossy_reencoded: false,
+    };
+  }
+
+  private expandPreprocessVariants(raw: any): string[] | undefined {
+    const variants = Array.isArray(raw) ? raw.map((v) => String(v).trim()).filter(Boolean) : [];
+    if (!variants.length) return undefined;
+    const expanded = new Set<string>();
+    for (const variant of variants) {
+      if (variant === "forensic") {
+        ["original", "deskew", "grayscale-normalize", "adaptive-threshold", "crop-only"].forEach((v) => expanded.add(v));
+      } else {
+        expanded.add(variant);
+      }
+    }
+    return [...expanded];
   }
 
   private async visionAnalyze(args: any): Promise<ToolResult> {
@@ -288,8 +366,12 @@ export class ToolRouter {
       concurrency: policy.concurrency,
       chunk_size: args.chunk_size,
       image_quality: policy.imageQuality,
-      max_image_width: args.max_image_width ?? MAX_IMAGE_WIDTH,
-      enable_thinking: args.enable_thinking,
+        max_image_width: args.max_image_width ?? MAX_IMAGE_WIDTH,
+        max_pixels: args.max_pixels,
+        min_pixels: args.min_pixels,
+        render_scale: args.render_scale,
+        lossless_mode: args.lossless_mode !== false,
+        enable_thinking: args.enable_thinking,
       thinking_budget: args.thinking_budget,
       vl_high_resolution_images: policy.vlHighResolutionImages,
       temperature: args.temperature,
@@ -363,6 +445,10 @@ export class ToolRouter {
           concurrency: policy.concurrency,
           image_quality: policy.imageQuality,
           max_image_width: args.max_image_width ?? MAX_IMAGE_WIDTH,
+          max_pixels: args.max_pixels,
+          min_pixels: args.min_pixels,
+          render_scale: args.render_scale,
+          lossless_mode: args.lossless_mode !== false,
           vl_high_resolution_images: policy.vlHighResolutionImages,
           self_consistency_votes: policy.selfConsistencyVotes,
           temperature: args.temperature ?? 0,
@@ -372,6 +458,11 @@ export class ToolRouter {
           budget_hint_usd: args.budget_hint_usd,
           max_unverified_required_fields: args.max_unverified_required_fields,
           ocr_verify: policy.ocrVerify,
+          provider_mode: args.provider_mode || "auto",
+          extraction_style: args.extraction_style || "model_first",
+          verification_mode: args.verification_mode || "strict",
+          return_evidence: args.return_evidence !== false,
+          return_quality_report: args.return_quality_report !== false,
         });
         const parsed = this.parseToolJson(result);
         if (parsed?.results) return aggregateLosslessPages(parsed.results, fields || [], filePath);
@@ -401,16 +492,39 @@ export class ToolRouter {
           return_cost_breakdown: args.return_cost_breakdown !== false,
           budget_hint_usd: args.budget_hint_usd,
           max_unverified_required_fields: args.max_unverified_required_fields,
+          provider_mode: args.provider_mode || "auto",
+          extraction_style: args.extraction_style || "model_first",
+          verification_mode: args.verification_mode || "strict",
+          return_evidence: args.return_evidence !== false,
+          return_quality_report: args.return_quality_report !== false,
         }));
       }
       return { error: `Unsupported extraction file type: ${extname(filePath)}` };
     });
 
     const reviewed = this.markReviewFields(value);
-    const metrics = collectTokenMetrics(reviewed);
-    const errors = this.summarizeErrors(reviewed);
+    const reviewedWithArtifacts =
+      args.return_artifacts && reviewed && typeof reviewed === "object"
+        ? {
+            ...reviewed,
+            artifacts: [
+              ...(Array.isArray((reviewed as any).artifacts) ? (reviewed as any).artifacts : []),
+              this.sourceArtifact(filePath, mediaType),
+              {
+                role: mediaType === "pdf" ? "rendered_lossless_png_ocr_candidate" : "original_lossless_or_png_ocr_candidate",
+                mime: mediaType === "pdf" ? "image/png" : extToMime(extname(filePath).toLowerCase()),
+                pages: Array.isArray((reviewed as any).pages) ? (reviewed as any).pages.map((p: any) => p.page) : undefined,
+                derived_from: "trusted_original",
+                lossy: false,
+              },
+            ],
+          }
+        : reviewed;
+    const metrics = collectTokenMetrics(reviewedWithArtifacts);
+    const errors = this.summarizeErrors(reviewedWithArtifacts);
+    const strictSuccess = args.strict_success !== false;
     return asTextEnvelope(envelope({
-      success: !errors && reviewed?.success !== false,
+      success: !errors && (!strictSuccess || reviewed?.success !== false),
       tool: "vision_extract",
       strategy: mediaType === "pdf" ? "pdf-fields" : "document-fields",
       summary: {
@@ -421,8 +535,13 @@ export class ToolRouter {
         cost_policy: args.cost_policy || "quality_first",
         cache_policy: args.cache_policy || "auto",
         budget_hint_usd: args.budget_hint_usd,
+        model_policy: args.model_policy || "quality_first",
+        provider_mode: args.provider_mode || "auto",
+        extraction_style: args.extraction_style || "model_first",
+        verification_mode: args.verification_mode || "strict",
+        return_quality_report: args.return_quality_report !== false,
       },
-      results: reviewed,
+      results: reviewedWithArtifacts,
       metrics: { elapsed_ms: elapsedMs, ...metrics },
       warnings: getCapabilityMatrix(this.provider).notes,
       errors,
@@ -432,11 +551,10 @@ export class ToolRouter {
   private buildFieldPrompt(fields: any[]): string {
     const names = fields.map((f) => f.name || f.label_pattern || f.labelPattern).filter(Boolean).join(", ");
     return [
-      "Perform lossless document extraction.",
-      "Preserve every visible text item, table, field candidate, unknown field, and orphan value.",
-      "After preserving all data, map requested fields when provided.",
-      "Do not fabricate missing or obscured values. Use [?] for uncertain characters.",
-      "Return JSON using schema lossless_document_v1.",
+      "Extract visible document data using model-first OCR.",
+      "Return null for absent, unreadable, or uncertain values.",
+      "Do not infer, complete, or fabricate values.",
+      "Keep evidence/confidence metadata when available.",
       `Requested fields: ${names || "(none; discover all visible fields)"}`,
     ].join("\n");
   }
@@ -446,13 +564,19 @@ export class ToolRouter {
     const capability = getCapabilityMatrix(this.provider);
     const { value, elapsedMs } = await timed(async () => {
       if (action === "status") {
-        return this.parseToolJson(await handleBatchStatus(this.provider, { batch_id: args.job_id }));
+        return args.wait_for_completion
+          ? this.waitForBatches([args.job_id], args)
+          : this.parseToolJson(await handleBatchStatus(this.provider, { batch_id: args.job_id }));
       }
       if (action === "status_all") {
-        return this.parseToolJson(await handleBatchStatusAll(this.provider, { batch_ids: args.job_ids }));
+        return args.wait_for_completion
+          ? this.waitForBatches(args.job_ids || [], args)
+          : this.parseToolJson(await handleBatchStatusAll(this.provider, { batch_ids: args.job_ids }));
       }
       if (action === "results") {
-        return this.parseToolJson(await handleBatchStatus(this.provider, { batch_id: args.job_id }));
+        return args.wait_for_completion
+          ? this.waitForBatches([args.job_id], args)
+          : this.parseToolJson(await handleBatchStatus(this.provider, { batch_id: args.job_id }));
       }
       if (action === "cancel") {
         return this.cancelBatch(args.job_id);
@@ -473,7 +597,11 @@ export class ToolRouter {
       if (this.mediaType(args.file_path) !== "pdf") return { error: "Only PDF batch submit is supported." };
 
       const total = await getPdfPageCount(args.file_path);
-      const pages = args.pages ? parsePageRange(args.pages, total) : Array.from({ length: total }, (_, i) => i + 1);
+      const parsedPages = args.pages
+        ? parsePageRangeDetailed(args.pages, total)
+        : { pages: Array.from({ length: total }, (_, i) => i + 1) };
+      if (parsedPages.error) return { error: parsedPages.error };
+      const pages = parsedPages.pages;
       const policy = resolveAccuracyPolicy(args);
       const submitted = await submitBatchedJobs(
         this.provider,
@@ -485,12 +613,19 @@ export class ToolRouter {
         args.max_image_width ?? MAX_IMAGE_WIDTH,
         args.enable_thinking,
         args.thinking_budget,
+        {
+          renderScale: args.render_scale,
+          maxPixels: args.max_pixels,
+          minPixels: args.min_pixels,
+          losslessMode: args.lossless_mode !== false,
+        },
       );
       return {
         total_pages: pages.length,
         batch_max_pages: BATCH_MAX_PAGES,
         batch_ids: submitted.batchIds,
         chunks: submitted.chunks,
+        ...(args.wait_for_completion ? { waited: await this.waitForBatches(submitted.batchIds, args) } : {}),
         message: submitted.batchIds.length === 1
           ? "Batch submitted. Poll with vision_jobs action=status."
           : "Batches submitted. Poll with vision_jobs action=status_all.",
@@ -513,6 +648,41 @@ export class ToolRouter {
     const client = (this.provider as any).getClient?.();
     if (!client?.batches?.cancel) return { error: "Provider does not expose batches.cancel" };
     return client.batches.cancel(jobId);
+  }
+
+  private async waitForBatches(batchIds: string[], args: any): Promise<any> {
+    const ids = (batchIds || []).filter(Boolean);
+    if (!ids.length) return { error: "job_id or job_ids required" };
+    const pollMs = Math.max(1000, Number(args.poll_interval_ms) || 5000);
+    const maxWaitMs = Math.max(pollMs, Number(args.max_wait_ms) || 300000);
+    const deadline = Date.now() + maxWaitMs;
+    let batches: any[] = [];
+
+    while (true) {
+      batches = await Promise.all(
+        ids.map(async (id) => this.parseToolJson(await handleBatchStatus(this.provider, { batch_id: id })))
+      );
+      const pending = batches.filter((b) => this.isBatchPending(b));
+      if (!pending.length) break;
+      if (Date.now() + pollMs > deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+
+    const pending = batches.filter((b) => this.isBatchPending(b));
+    return {
+      summary: {
+        total_batches: batches.length,
+        completed: batches.filter((b) => b.status === "completed").length,
+        pending: pending.length,
+        failed: batches.filter((b) => ["failed", "error", "expired", "cancelled"].includes(b.status)).length,
+        wait_expired: pending.length > 0,
+      },
+      batches,
+    };
+  }
+
+  private isBatchPending(batch: any): boolean {
+    return batch?.pending === true || ["queued", "validating", "in_progress"].includes(batch?.status);
   }
 
   private async listBatches(): Promise<any> {

@@ -15,7 +15,7 @@ import {
 import { renderPageSmart, getPdfPageCount, getPdfType } from "../rendering/pdf.js";
 import { optimizeForVision } from "../rendering/image.js";
 import { retryWithBackoff } from "../utils/retry.js";
-import { parsePageRange, chunkArray, isDocExtractionPrompt, isHandwritingPrompt, isFieldExtractionPrompt } from "../utils/helpers.js";
+import { parsePageRangeDetailed, chunkArray, isDocExtractionPrompt, isHandwritingPrompt, isFieldExtractionPrompt } from "../utils/helpers.js";
 import { packImagesByTokenBudget } from "../utils/tokens.js";
 import { enhancePrompt } from "./helpers.js";
 import { extractLosslessDocument } from "../extraction/lossless.js";
@@ -36,6 +36,8 @@ export async function handleAnalyzePdf(
   const vlHighRes = args.vl_high_resolution_images as boolean | undefined;
   const maxPixels = args.max_pixels as number | undefined;
   const minPixels = args.min_pixels as number | undefined;
+  const renderScale = args.render_scale as number | undefined;
+  const losslessMode = args.lossless_mode !== false;
   const forceStrategy = args.strategy as string | undefined;
   const chunkSizeOverride = (args.chunk_size as number) || PDF_CHUNK_SIZE;
   const rawFields = args.fields as any[] | undefined;
@@ -48,14 +50,23 @@ export async function handleAnalyzePdf(
     return_cost_breakdown: args.return_cost_breakdown,
     max_unverified_required_fields: args.max_unverified_required_fields,
     ocr_verify: args.ocr_verify,
+    provider_mode: args.provider_mode,
+    extraction_style: args.extraction_style,
+    verification_mode: args.verification_mode,
+    return_evidence: args.return_evidence,
+    return_quality_report: args.return_quality_report,
   };
 
   if (!path) return { content: [{ type: "text", text: "Error: pdf_path required" }] };
   if (!prompt) return { content: [{ type: "text", text: "Error: prompt required" }] };
 
   const total = await getPdfPageCount(path);
-  const nums = pagesRaw ? parsePageRange(pagesRaw, total) : Array.from({ length: total }, (_, i) => i + 1);
-  if (!nums.length) return { content: [{ type: "text", text: `Error: No valid pages in "${pagesRaw}" (total: ${total})` }] };
+  const parsedPages = pagesRaw
+    ? parsePageRangeDetailed(pagesRaw, total)
+    : { pages: Array.from({ length: total }, (_, i) => i + 1) };
+  if (parsedPages.error) return { content: [{ type: "text", text: JSON.stringify({ error: parsedPages.error }) }] };
+  const nums = parsedPages.pages;
+  if (!nums.length) return { content: [{ type: "text", text: JSON.stringify({ error: `No valid pages in "${pagesRaw}" (total: ${total})` }) }] };
 
   const strategy = selectStrategy(nums.length, forceStrategy);
   console.error(`[analyze_pdf] ${nums.length} pages, strategy=${strategy}`);
@@ -64,13 +75,13 @@ export async function handleAnalyzePdf(
 
   switch (strategy) {
     case "batch":
-      return handleBatchStrategy(provider, path, nums, enhancedPrompt, mt, imgQuality, imgMaxWidth, enableThinking, thinkingBudget);
+      return handleBatchStrategy(provider, path, nums, enhancedPrompt, mt, imgQuality, imgMaxWidth, enableThinking, thinkingBudget, { renderScale, maxPixels, minPixels, losslessMode });
 
     case "multi-image":
-      return handleMultiImageStrategy(provider, path, nums, enhancedPrompt, mt, concurrency, imgQuality, imgMaxWidth, enableThinking, thinkingBudget, vlHighRes, maxPixels, minPixels, temperature, topP, chunkSizeOverride, rawFields, scVotes, extractionOptions);
+      return handleMultiImageStrategy(provider, path, nums, enhancedPrompt, mt, concurrency, imgQuality, imgMaxWidth, enableThinking, thinkingBudget, vlHighRes, maxPixels, minPixels, temperature, topP, chunkSizeOverride, rawFields, scVotes, extractionOptions, { renderScale, losslessMode });
 
     case "concurrent":
-      return handleConcurrentStrategy(provider, path, nums, enhancedPrompt, mt, concurrency, imgQuality, imgMaxWidth, enableThinking, thinkingBudget, vlHighRes, maxPixels, minPixels, temperature, topP, rawFields, scVotes, extractionOptions);
+      return handleConcurrentStrategy(provider, path, nums, enhancedPrompt, mt, concurrency, imgQuality, imgMaxWidth, enableThinking, thinkingBudget, vlHighRes, maxPixels, minPixels, temperature, topP, rawFields, scVotes, extractionOptions, { renderScale, losslessMode });
 
     default:
       return { content: [{ type: "text", text: `Error: Unknown strategy: ${strategy}` }] };
@@ -95,7 +106,8 @@ async function handleBatchStrategy(
   imgQuality: number,
   imgMaxWidth: number,
   enableThinking?: boolean,
-  thinkingBudget?: number
+  thinkingBudget?: number,
+  renderOptions: { renderScale?: number; maxPixels?: number; minPixels?: number; losslessMode?: boolean } = {}
 ) {
   const { submitBatchedJobs } = await import("../batch/manager.js");
   const { BATCH_MAX_PAGES } = await import("../config/constants.js");
@@ -103,7 +115,7 @@ async function handleBatchStrategy(
   console.error(`[analyze_pdf] Splitting ${nums.length} pages into ${chunks.length} batch jobs`);
 
   const { batchIds } = await submitBatchedJobs(
-    provider, path, nums, prompt, mt, imgQuality, imgMaxWidth, enableThinking, thinkingBudget
+    provider, path, nums, prompt, mt, imgQuality, imgMaxWidth, enableThinking, thinkingBudget, renderOptions
   );
 
   return {
@@ -138,7 +150,8 @@ async function handleConcurrentStrategy(
   topP?: number,
   rawFields?: any[],
   scVotes?: number,
-  extractionOptions: Record<string, any> = {}
+  extractionOptions: Record<string, any> = {},
+  renderOptions: { renderScale?: number; losslessMode?: boolean } = {}
 ) {
   if (nums.length > 200) {
     return { content: [{ type: "text" as const, text: `Error: Too many pages (${nums.length}) for concurrent strategy. Use strategy=multi-image or strategy=batch.` }] };
@@ -156,12 +169,20 @@ async function handleConcurrentStrategy(
   const qualityAdjustedC = _isDocC && imgQualityIn < MIN_OCR_QUALITY;
   
   // Render all pages first
+  const applyGenericPreprocess =
+    rawFields !== undefined && (extractionOptions.extraction_style || "model_first") === "model_first"
+      ? false
+      : ENABLE_PREPROCESSING;
   const prepared = await Promise.all(
     nums.map((pn) =>
       limit(async () => {
         try {
-          const img = await renderPageSmart(path, pn, imgMaxWidth, ENABLE_PREPROCESSING, isHandwritingPrompt(prompt), !PREPROCESS_WITH_THINKING && (enableThinking ?? false));
-          const isIb = IMAGE_PDF_LOSSLESS ? (getPdfType(path) === "image") : false; const opt = await optimizeForVision(img, { quality: imgQuality, maxWidth: imgMaxWidth, isImageBasedPdf: isIb });
+          const img = await renderPageSmart(path, pn, imgMaxWidth, applyGenericPreprocess, isHandwritingPrompt(prompt), !PREPROCESS_WITH_THINKING && (enableThinking ?? false), {
+            renderScale: renderOptions.renderScale,
+            maxPixels,
+            losslessMode: renderOptions.losslessMode !== false,
+          });
+          const isIb = IMAGE_PDF_LOSSLESS ? (getPdfType(path) === "image") : false; const opt = await optimizeForVision(img, { quality: imgQuality, maxWidth: imgMaxWidth, isImageBasedPdf: isIb, preferLossless: renderOptions.losslessMode !== false });
           return { page: pn, buffer: opt.buffer, mime: opt.mime, error: null as string | null };
         } catch (err: any) {
           return { page: pn, buffer: null as any, mime: "", error: err.message };
@@ -187,6 +208,13 @@ async function handleConcurrentStrategy(
                   maxUnverifiedRequiredFields: extractionOptions.max_unverified_required_fields,
                   costPolicy: extractionOptions.cost_policy,
                   cachePolicy: extractionOptions.cache_policy,
+                  minPixels,
+                  maxPixels,
+                  providerMode: extractionOptions.provider_mode,
+                  extractionStyle: extractionOptions.extraction_style,
+                  verificationMode: extractionOptions.verification_mode,
+                  returnEvidence: extractionOptions.return_evidence,
+                  returnQualityReport: extractionOptions.return_quality_report,
                 }),
                 `Page ${x.page} (lossless)`
               )
@@ -243,7 +271,7 @@ async function handleConcurrentStrategy(
   const summary: ProcessingSummary = {
     strategy: "concurrent",
     pipeline: {
-      preprocessing: ENABLE_PREPROCESSING,
+      preprocessing: applyGenericPreprocess,
       layered_extraction: rawFields !== undefined,
       structured_output: rawFields !== undefined,
       lossless_extraction: rawFields !== undefined,
@@ -287,7 +315,8 @@ async function handleMultiImageStrategy(
   chunkSizeOverride?: number,
   rawFields?: any[],
   scVotes?: number,
-  extractionOptions: Record<string, any> = {}
+  extractionOptions: Record<string, any> = {},
+  renderOptions: { renderScale?: number; losslessMode?: boolean } = {}
 ) {
   const limit = pLimit(concurrency);
   const tStart = Date.now();
@@ -299,12 +328,20 @@ async function handleMultiImageStrategy(
   
   // Render all pages concurrently
   console.error(`[analyze_pdf] Multi-image: rendering ${nums.length} pages...`);
+  const applyGenericPreprocess =
+    rawFields !== undefined && (extractionOptions.extraction_style || "model_first") === "model_first"
+      ? false
+      : ENABLE_PREPROCESSING;
   const preparedAll = await Promise.all(
     nums.map((pn) =>
       limit(async () => {
         try {
-          const img = await renderPageSmart(path, pn, imgMaxWidth, ENABLE_PREPROCESSING, isHandwritingPrompt(prompt), !PREPROCESS_WITH_THINKING && (enableThinking ?? false));
-          const isIb = IMAGE_PDF_LOSSLESS ? (getPdfType(path) === "image") : false; const opt = await optimizeForVision(img, { quality: imgQuality, maxWidth: imgMaxWidth, isImageBasedPdf: isIb });
+          const img = await renderPageSmart(path, pn, imgMaxWidth, applyGenericPreprocess, isHandwritingPrompt(prompt), !PREPROCESS_WITH_THINKING && (enableThinking ?? false), {
+            renderScale: renderOptions.renderScale,
+            maxPixels,
+            losslessMode: renderOptions.losslessMode !== false,
+          });
+          const isIb = IMAGE_PDF_LOSSLESS ? (getPdfType(path) === "image") : false; const opt = await optimizeForVision(img, { quality: imgQuality, maxWidth: imgMaxWidth, isImageBasedPdf: isIb, preferLossless: renderOptions.losslessMode !== false });
           return { page: pn, buffer: opt.buffer, mime: opt.mime, width: img.width, height: img.height, error: null as string | null };
         } catch (err: any) {
           return { page: pn, buffer: null as any, mime: "", width: 0, height: 0, error: err.message };
@@ -342,6 +379,13 @@ async function handleMultiImageStrategy(
                   maxUnverifiedRequiredFields: extractionOptions.max_unverified_required_fields,
                   costPolicy: extractionOptions.cost_policy,
                   cachePolicy: extractionOptions.cache_policy,
+                  minPixels,
+                  maxPixels,
+                  providerMode: extractionOptions.provider_mode,
+                  extractionStyle: extractionOptions.extraction_style,
+                  verificationMode: extractionOptions.verification_mode,
+                  returnEvidence: extractionOptions.return_evidence,
+                  returnQualityReport: extractionOptions.return_quality_report,
                 }),
                 `Page ${p.page} (lossless)`
               ).then((res: any) => ({
@@ -404,7 +448,7 @@ async function handleMultiImageStrategy(
         ...(qualityAdjustedM ? { quality_adjusted: true, adjusted_from: imgQualityIn } : {}),
         summary: {
           strategy: budgetLabel,
-          pipeline: { preprocessing: ENABLE_PREPROCESSING, layered_extraction: rawFields !== undefined, structured_output: rawFields !== undefined, lossless_extraction: rawFields !== undefined },
+          pipeline: { preprocessing: applyGenericPreprocess, layered_extraction: rawFields !== undefined, structured_output: rawFields !== undefined, lossless_extraction: rawFields !== undefined },
           requested: nums.length,
           successful: ok,
           failed: nums.length - ok,

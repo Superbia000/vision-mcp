@@ -118,9 +118,6 @@ export const MAX_PIXELS_DENSE = (() => { const n = Number(process.env.VISION_MAX
 /** Default min_pixels (4*32*32 = 4096) */
 export const MIN_PIXELS = (() => { const n = Number(process.env.VISION_MIN_PIXELS); return isNaN(n) ? 4 * 32 * 32 : n; })();
 
-/** Minimum PDF render DPI */
-export const MIN_PDF_DPI = Number(process.env.VISION_MIN_PDF_DPI) || 300;
-
 // ---- v8: Consensus Entropy (CE) ----
 
 /** Enable consensus entropy scoring */
@@ -221,6 +218,9 @@ export const SECOND_PASS_MODEL = process.env.VISION_SECOND_PASS_MODEL || "qwen3-
 /** For image-based PDFs, keep PNG lossless (no WebP/JPEG re-compression) */
 export const IMAGE_PDF_LOSSLESS = process.env.VISION_IMAGE_PDF_LOSSLESS !== "false";
 
+/** Lossless document/image handling by default: PNG or original lossless buffers, no lossy middleware. */
+export const LOSSLESS_MODE = process.env.VISION_LOSSLESS_MODE !== "false";
+
 /** Max image dimension (width or height) in pixels. 0 = no limit. Default 4096. */
 export const IMAGE_MAX_DIMENSION = (() => { const n = Number(process.env.VISION_IMAGE_MAX_DIMENSION); return isNaN(n) || n < 0 ? 4096 : n; })();
 
@@ -256,6 +256,6 @@ export function logConfig() {
     `strategy=${EXTRACTION_STRATEGY} scanned=${SCANNED_STRATEGY} multipass=${MULTIPASS_ENABLED}@${MULTIPASS_VOTES} | ` +
     `l2_pad=${L2_CROP_PADDING} l2_pp=${L2_PREPROCESS_ENABLED} | ` +
     `quality: min_ocr_q=${MIN_OCR_QUALITY} prep_think=${PREPROCESS_WITH_THINKING} l1_to=${L1_TIMEOUT_MS}ms l4_ce=${L4_ONLY_HIGH_CE} sp=${SECOND_PASS_ENABLED}@${SECOND_PASS_MODEL} | ` +
-    `image_pdf: lossless=${IMAGE_PDF_LOSSLESS} max_dim=${IMAGE_MAX_DIMENSION} max_bytes=${(IMAGE_MAX_BYTES/1024/1024).toFixed(0)}MB fallback=${IMAGE_COMPRESSION_FALLBACK} jpg_q=${IMAGE_JPEG_QUALITY}`
+    `image_pdf: lossless=${IMAGE_PDF_LOSSLESS} lossless_mode=${LOSSLESS_MODE} max_dim=${IMAGE_MAX_DIMENSION} max_bytes=${(IMAGE_MAX_BYTES/1024/1024).toFixed(0)}MB fallback=${IMAGE_COMPRESSION_FALLBACK} jpg_q=${IMAGE_JPEG_QUALITY}`
   );
 }

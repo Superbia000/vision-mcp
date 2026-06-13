@@ -1,3 +1,4 @@
+import sharp from "sharp";
 import type { VisionProvider } from "../providers/base.js";
 import type {
   CostBreakdownEntry,
@@ -10,6 +11,7 @@ import type {
 import {
   MAX_OUTPUT_TOKENS,
   MODEL,
+  OCR_MODEL,
   OUTPUT_SCHEMA,
   PRESERVE_ALL,
   RETURN_COST_BREAKDOWN,
@@ -33,6 +35,13 @@ export interface LosslessExtractOptions {
   maxUnverifiedRequiredFields?: number;
   costPolicy?: string;
   cachePolicy?: string;
+  minPixels?: number;
+  maxPixels?: number;
+  providerMode?: "auto" | "dashscope_native" | "openai_compat";
+  extractionStyle?: "model_first";
+  verificationMode?: "off" | "strict";
+  returnEvidence?: boolean;
+  returnQualityReport?: boolean;
 }
 
 export function toFieldSpecs(rawFields?: any[]): FieldSpec[] {
@@ -55,15 +64,224 @@ export async function extractLosslessDocument(
   rawFields?: any[],
   options: LosslessExtractOptions = {}
 ): Promise<LosslessDocumentResult> {
+  const providerMode = options.providerMode || "auto";
+  const extractionStyle = options.extractionStyle || "model_first";
+  if (
+    extractionStyle === "model_first" &&
+    providerMode !== "openai_compat" &&
+    provider.supportsNativeOcr()
+  ) {
+    try {
+      return await extractModelFirstDocument(provider, imageBuffer, imageMime, rawFields, options);
+    } catch (err: any) {
+      if (providerMode === "dashscope_native") throw err;
+      console.error(`[lossless] Native model-first OCR failed; falling back to OpenAI-compatible path: ${err?.message || err}`);
+    }
+  }
+  return extractPromptLosslessDocument(provider, imageBuffer, imageMime, rawFields, options);
+}
+
+async function extractModelFirstDocument(
+  provider: VisionProvider,
+  imageBuffer: Buffer,
+  imageMime: string,
+  rawFields?: any[],
+  options: LosslessExtractOptions = {}
+): Promise<LosslessDocumentResult> {
   const started = Date.now();
   const fieldSpecs = toFieldSpecs(rawFields);
   const docType = options.docType || (await detectDocumentType(imageBuffer)).type;
   const pageNumber = options.page ?? 1;
+  const extractionModel = OCR_MODEL || MODEL;
+  const strict = (options.verificationMode || "strict") !== "off";
+  const estimatedImageTokens = await estimateImageTokens(imageBuffer);
+  const imageQuality = await assessImageQuality(imageBuffer);
+
+  const advanced = await provider.nativeOcr({
+    model: extractionModel,
+    image: imageBuffer,
+    mime: imageMime,
+    task: "advanced_recognition",
+    max_tokens: options.maxTokens || MAX_OUTPUT_TOKENS,
+    min_pixels: options.minPixels,
+    max_pixels: options.maxPixels,
+    enable_rotate: true,
+    temperature: 0,
+  });
+
+  const parsed = await provider.nativeOcr({
+    model: extractionModel,
+    image: imageBuffer,
+    mime: imageMime,
+    task: "document_parsing",
+    max_tokens: options.maxTokens || MAX_OUTPUT_TOKENS,
+    min_pixels: options.minPixels,
+    max_pixels: options.maxPixels,
+    enable_rotate: true,
+    temperature: 0,
+  });
+
+  const wordsInfo = normalizeWordsInfo(advanced.ocrResult?.words_info);
+  const advancedText = wordsInfo.map((item) => item.text).filter(Boolean).join("\n") || advanced.text;
+  const documentText = parsed.text || "";
+  const rawMarkdown = documentText || advancedText;
+  const pageIsLowQuality = imageQuality.quality === "low" || (!advancedText.trim() && wordsInfo.length < 3);
+  const nativeExtractedFields = fieldSpecs.length
+    ? await runModelKeyExtraction(provider, extractionModel, imageBuffer, imageMime, fieldSpecs, options, buildOcrContext(advancedText, documentText))
+    : {};
+  const reviewExtractedFields = fieldSpecs.length && !pageIsLowQuality && (options.providerMode || "auto") === "auto"
+    ? await runModelReviewExtraction(provider, extractionModel, imageBuffer, imageMime, fieldSpecs, options, buildOcrContext(advancedText, documentText))
+    : undefined;
+  const modelExtractedFields = reviewExtractedFields
+    ? mergeModelExtractedFields(nativeExtractedFields, reviewExtractedFields, fieldSpecs, wordsInfo, advancedText, documentText, strict, pageIsLowQuality)
+    : nativeExtractedFields;
+  const fieldEvidence: Record<string, any> = {};
+  const mappedFields: Record<string, any> = {};
+  const reviewRequiredFields: any[] = [];
+  const finalJson: Record<string, any> = {};
+
+  for (const spec of fieldSpecs) {
+    const rawValue = readModelFieldValue(modelExtractedFields, spec.name);
+    const value = normalizeModelValue(rawValue);
+    const evidence = value ? findEvidence(value, wordsInfo, advancedText, documentText) : { found: false, reason: "model returned empty value" };
+    const valid = value ? fieldValueLooksValid(value, spec) : false;
+    const safety = value ? fieldSafetyCheck(value, spec, advancedText, documentText) : { passed: false, reasons: [] as string[] };
+    const hasUncertainty = value.includes("?") || value.includes("[?]");
+    const accepted = !!value && valid && safety.passed && (!strict || (evidence.found && !pageIsLowQuality && !hasUncertainty));
+    const reasons = [
+      !value ? "missing" : undefined,
+      value && !valid ? "format_validation_failed" : undefined,
+      value && !safety.passed ? safety.reasons : undefined,
+      value && strict && !evidence.found ? "evidence_not_found_in_ocr_text" : undefined,
+      value && strict && pageIsLowQuality ? "page_quality_low" : undefined,
+      value && strict && hasUncertainty ? "uncertain_character" : undefined,
+    ].flat().filter(Boolean) as string[];
+
+    const entry = {
+      value,
+      normalized_value: value,
+      confidence: accepted ? "high" : value && valid && evidence.found ? "medium" : "low",
+      verified: accepted,
+      needs_review: !accepted,
+      validation_state: accepted ? "accepted" : value ? "needs_review" : "missing",
+      evidence,
+      safety,
+      reasons,
+      source: "dashscope_native_key_information_extraction",
+      required_unverified: spec.required !== false && !accepted,
+    };
+    mappedFields[spec.name] = entry;
+    fieldEvidence[spec.name] = evidence;
+    if (accepted) {
+      finalJson[spec.name] = entry;
+    } else if (spec.required !== false || value) {
+      reviewRequiredFields.push({ field: spec.name, value, reasons, evidence });
+    }
+  }
+
+  const qualityReport = {
+    page: pageNumber,
+    doc_type: docType,
+    image_quality: imageQuality,
+    ocr_text_chars: advancedText.length,
+    document_text_chars: documentText.length,
+    words_info_count: wordsInfo.length,
+    hallucination_risk: pageIsLowQuality ||
+      allRequiredFieldsMissing(fieldSpecs, reviewRequiredFields) ||
+      reviewRequiredFields.some((f) => f.reasons.includes("evidence_not_found_in_ocr_text"))
+      ? "high"
+      : reviewRequiredFields.length
+        ? "medium"
+        : "low",
+    gate_policy: strict ? "strict_evidence_required" : "format_only",
+  };
+
+  const page: LosslessPage = {
+    page: pageNumber,
+    raw_markdown: rawMarkdown,
+    raw_html: "",
+    text_items: wordsInfo.map((item) => ({
+      text: item.text,
+      bbox: item.bbox,
+      confidence: "medium",
+      source: "dashscope_native_advanced_recognition",
+    })),
+    tables: [],
+    field_candidates: Object.entries(modelExtractedFields)
+      .map(([name, rawValue]) => ({
+        name,
+        value: normalizeModelValue(rawValue),
+        confidence: "medium" as Confidence,
+        source: modelFieldSource(rawValue),
+        needs_review: mappedFields[name]?.needs_review !== false,
+      }))
+      .filter((item) => item.value),
+    mapped_fields: mappedFields,
+    unmapped_fields: [],
+    orphan_values: [],
+    uncertain_tokens: reviewRequiredFields.filter((item) => String(item.value || "").includes("?")),
+    review_required: reviewRequiredFields.length > 0 || pageIsLowQuality,
+  };
+
+  const qualityGate = buildQualityGate([page], fieldSpecs, options.maxUnverifiedRequiredFields ?? 0);
+  const costBreakdown: CostBreakdownEntry[] = [
+    toCostEntry("model_first_advanced_recognition", extractionModel, advanced, estimatedImageTokens, started, options),
+    toCostEntry("model_first_document_parsing", extractionModel, parsed, estimatedImageTokens, started, options),
+  ];
+  if ((modelExtractedFields as any).__usage) {
+    costBreakdown.push((modelExtractedFields as any).__usage);
+    delete (modelExtractedFields as any).__usage;
+  }
+  if ((nativeExtractedFields as any).__usage) {
+    costBreakdown.push((nativeExtractedFields as any).__usage);
+    delete (nativeExtractedFields as any).__usage;
+  }
+  if ((reviewExtractedFields as any)?.__usage) {
+    costBreakdown.push((reviewExtractedFields as any).__usage);
+    delete (reviewExtractedFields as any).__usage;
+  }
+
+  return {
+    success: qualityGate.passed && !pageIsLowQuality,
+    schema: "lossless_document_v1",
+    source_path: options.sourcePath,
+    pages: [page],
+    finalJson,
+    modelExtractedFields,
+    fieldEvidence: options.returnEvidence !== false ? fieldEvidence : undefined,
+    reviewRequiredFields,
+    qualityReport: options.returnQualityReport !== false ? qualityReport : undefined,
+    costBreakdown: (options.returnCostBreakdown ?? RETURN_COST_BREAKDOWN) ? costBreakdown : undefined,
+    review_required: page.review_required || !qualityGate.passed || pageIsLowQuality,
+    quality_gate: pageIsLowQuality
+      ? { passed: false, reason: "page quality too low for automatic acceptance" }
+      : qualityGate,
+    stats: {
+      totalApiCalls: fieldSpecs.length ? 3 + (reviewExtractedFields ? 1 : 0) : 2,
+      totalTokens: summarizeCost(costBreakdown).total_input_tokens || 0,
+      elapsedMs: Date.now() - started,
+      pageCount: 1,
+    },
+  } as LosslessDocumentResult;
+}
+
+async function extractPromptLosslessDocument(
+  provider: VisionProvider,
+  imageBuffer: Buffer,
+  imageMime: string,
+  rawFields?: any[],
+  options: LosslessExtractOptions = {}
+): Promise<LosslessDocumentResult> {
+  const started = Date.now();
+  const fieldSpecs = toFieldSpecs(rawFields);
+  const docType = options.docType || (await detectDocumentType(imageBuffer)).type;
+  const pageNumber = options.page ?? 1;
+  const extractionModel = OCR_MODEL || MODEL;
   const prompt = buildLosslessDocumentPrompt(docType, fieldSpecs, pageNumber);
   const estimatedImageTokens = await estimateImageTokens(imageBuffer);
 
   const response = await provider.chat({
-    model: MODEL,
+    model: extractionModel,
     max_tokens: options.maxTokens || MAX_OUTPUT_TOKENS,
     temperature: 0,
     messages: [{
@@ -74,7 +292,8 @@ export async function extractLosslessDocument(
       ],
     }],
     vl_high_resolution_images: options.vlHighResolutionImages ?? VL_HIGH_RES_ENABLED,
-    response_format: { type: "json_object" },
+    min_pixels: options.minPixels,
+    max_pixels: options.maxPixels,
   });
 
   const parsed = parseJsonObject(response.text);
@@ -82,7 +301,7 @@ export async function extractLosslessDocument(
   const qualityGate = buildQualityGate([page], fieldSpecs, options.maxUnverifiedRequiredFields ?? 0);
   const costBreakdown: CostBreakdownEntry[] = [{
     stage: "lossless_full_page",
-    model: MODEL,
+    model: extractionModel,
     input_tokens: response.it,
     output_tokens: response.ot,
     estimated_image_tokens: estimatedImageTokens,
@@ -100,7 +319,7 @@ export async function extractLosslessDocument(
     schema: "lossless_document_v1",
     source_path: options.sourcePath,
     pages: [page],
-    finalJson: buildFinalJson([page], fieldSpecs),
+    finalJson: buildAcceptedFinalJson([page], fieldSpecs),
     costBreakdown: (options.returnCostBreakdown ?? RETURN_COST_BREAKDOWN) ? costBreakdown : undefined,
     review_required: page.review_required || !qualityGate.passed,
     quality_gate: qualityGate,
@@ -114,6 +333,476 @@ export async function extractLosslessDocument(
   };
 }
 
+async function runModelKeyExtraction(
+  provider: VisionProvider,
+  extractionModel: string,
+  imageBuffer: Buffer,
+  imageMime: string,
+  fieldSpecs: FieldSpec[],
+  options: LosslessExtractOptions,
+  ocrContext?: string
+): Promise<Record<string, any>> {
+  const started = Date.now();
+  const result = await provider.nativeOcr({
+    model: extractionModel,
+    image: imageBuffer,
+    mime: imageMime,
+    task: "key_information_extraction",
+    resultSchema: buildModelFirstResultSchema(fieldSpecs),
+    text: [
+      "Extract only information that is visibly present in the document image.",
+      "Return the field value only; do not include printed labels, captions, column headers, or neighboring values.",
+      "If one OCR string contains multiple requested values, split them into the matching fields.",
+      "Return null for absent, unreadable, or uncertain values.",
+      "Do not infer, complete, or fabricate values.",
+      ocrContext ? `Model OCR context for cross-checking only:\n${ocrContext}` : undefined,
+    ].join(" "),
+    max_tokens: options.maxTokens || MAX_OUTPUT_TOKENS,
+    min_pixels: options.minPixels,
+    max_pixels: options.maxPixels,
+    enable_rotate: true,
+    temperature: 0,
+  });
+
+  const parsed = result.ocrResult?.kv_result || parseJsonObject(result.text) || {};
+  const fields = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
+  Object.defineProperty(fields, "__usage", {
+    value: {
+      stage: "model_first_key_information_extraction",
+      model: extractionModel,
+      input_tokens: result.it,
+      output_tokens: result.ot,
+      estimated_image_tokens: result.imageTokens,
+      elapsed_ms: Date.now() - started,
+      cost_policy: options.costPolicy || "quality_first",
+      notes: [
+        `cache_policy=${options.cachePolicy || "auto"}`,
+        "model-first native Qwen-OCR result_schema extraction",
+      ],
+    } satisfies CostBreakdownEntry,
+    enumerable: false,
+    configurable: true,
+  });
+  return fields;
+}
+
+function buildOcrContext(advancedText: string, documentText: string): string {
+  const parts = [
+    documentText ? `Document parsing text:\n${documentText}` : "",
+    advancedText && advancedText !== documentText ? `Advanced recognition text:\n${advancedText}` : "",
+  ].filter(Boolean);
+  const text = parts.join("\n\n").trim();
+  return text.length > 6000 ? `${text.slice(0, 6000)}\n[truncated]` : text;
+}
+
+async function runModelReviewExtraction(
+  provider: VisionProvider,
+  extractionModel: string,
+  imageBuffer: Buffer,
+  imageMime: string,
+  fieldSpecs: FieldSpec[],
+  options: LosslessExtractOptions,
+  ocrContext?: string
+): Promise<Record<string, any>> {
+  const started = Date.now();
+  const fieldLines = fieldSpecs.map((spec) => {
+    const readableName = spec.name.replace(/[_-]+/g, " ").trim() || spec.name;
+    const semantic = semanticHintForField(spec.name);
+    const format = spec.formatHint ? ` Expected format: ${spec.formatHint}.` : "";
+    return `- ${spec.name}: ${readableName}.${semantic ? ` ${semantic}` : ""}${format}`;
+  }).join("\n");
+  const response = await provider.chat({
+    model: extractionModel,
+    max_tokens: Math.min(options.maxTokens || MAX_OUTPUT_TOKENS, 8192),
+    temperature: 0,
+    messages: [{
+      role: "user",
+      content: [
+        { type: "image_url", image_url: { url: `data:${imageMime};base64,${imageBuffer.toString("base64")}` } },
+        {
+          type: "text",
+          text: [
+            "Extract visible document data for the requested schema.",
+            "Return strict JSON only, with exactly the requested keys.",
+            "Use null for absent, unreadable, or uncertain values.",
+            "Return values only; do not include labels, captions, headers, or neighboring values.",
+            "Do not infer, complete, calculate, or fabricate values.",
+            "Requested fields:",
+            fieldLines,
+            ocrContext ? `Model OCR context for cross-checking only:\n${ocrContext}` : "",
+          ].filter(Boolean).join("\n"),
+        },
+      ],
+    }],
+    vl_high_resolution_images: options.vlHighResolutionImages ?? VL_HIGH_RES_ENABLED,
+    min_pixels: options.minPixels,
+    max_pixels: options.maxPixels,
+  });
+
+  const parsed = parseJsonObject(response.text) || {};
+  const fields = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
+  Object.defineProperty(fields, "__usage", {
+    value: {
+      stage: "model_first_review_extraction",
+      model: extractionModel,
+      input_tokens: response.it,
+      output_tokens: response.ot,
+      estimated_image_tokens: (response as any).imageTokens,
+      elapsed_ms: Date.now() - started,
+      cost_policy: options.costPolicy || "quality_first",
+      notes: [
+        `cache_policy=${options.cachePolicy || "auto"}`,
+        "model-first Qwen-VL review extraction; no local field filling",
+      ],
+    } satisfies CostBreakdownEntry,
+    enumerable: false,
+    configurable: true,
+  });
+  return fields;
+}
+
+function mergeModelExtractedFields(
+  nativeFields: Record<string, any>,
+  reviewFields: Record<string, any>,
+  fieldSpecs: FieldSpec[],
+  wordsInfo: { text: string; bbox?: any }[],
+  advancedText: string,
+  documentText: string,
+  strict: boolean,
+  pageIsLowQuality: boolean
+): Record<string, any> {
+  const merged: Record<string, any> = {};
+  for (const spec of fieldSpecs) {
+    const nativeValue = readModelFieldValue(nativeFields, spec.name);
+    const reviewValue = readModelFieldValue(reviewFields, spec.name);
+    const nativeAccepted = modelFieldPassesGate(nativeValue, spec, wordsInfo, advancedText, documentText, strict, pageIsLowQuality);
+    const reviewAccepted = modelFieldPassesGate(reviewValue, spec, wordsInfo, advancedText, documentText, strict, pageIsLowQuality);
+    if (nativeAccepted) {
+      merged[spec.name] = nativeValue;
+    } else if (reviewAccepted) {
+      merged[spec.name] = { value: normalizeModelValue(reviewValue), source: "model_first_review_extraction" };
+    } else if (normalizeModelValue(nativeValue)) {
+      merged[spec.name] = nativeValue;
+    } else if (normalizeModelValue(reviewValue)) {
+      merged[spec.name] = { value: normalizeModelValue(reviewValue), source: "model_first_review_extraction" };
+    }
+  }
+  return merged;
+}
+
+function modelFieldPassesGate(
+  rawValue: any,
+  spec: FieldSpec,
+  wordsInfo: { text: string; bbox?: any }[],
+  advancedText: string,
+  documentText: string,
+  strict: boolean,
+  pageIsLowQuality: boolean
+): boolean {
+  const value = normalizeModelValue(rawValue);
+  if (!value || value.includes("?") || value.includes("[?]")) return false;
+  if (!fieldValueLooksValid(value, spec)) return false;
+  if (!fieldSafetyCheck(value, spec, advancedText, documentText).passed) return false;
+  if (!strict) return true;
+  return !pageIsLowQuality && findEvidence(value, wordsInfo, advancedText, documentText).found;
+}
+
+function modelFieldSource(rawValue: any): string {
+  if (rawValue && typeof rawValue === "object" && rawValue.source) return String(rawValue.source);
+  return "dashscope_native_key_information_extraction";
+}
+
+function buildModelFirstResultSchema(fieldSpecs: FieldSpec[]): Record<string, string> {
+  const schema: Record<string, string> = {};
+  for (const spec of fieldSpecs) {
+    const readableName = spec.name.replace(/[_-]+/g, " ").trim() || spec.name;
+    const hints = [
+      `Field: ${readableName}.`,
+      semanticHintForField(spec.name),
+      spec.formatHint ? `Expected format: ${spec.formatHint}.` : undefined,
+      "Return only the value, never the label text.",
+      "Extract only if visibly present; return null if absent or unreadable.",
+    ].filter(Boolean);
+    schema[spec.name] = hints.join(" ");
+  }
+  return schema;
+}
+
+function semanticHintForField(name: string): string | undefined {
+  const normalized = name.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+  if (normalized.includes("invoice") && normalized.includes("number")) {
+    return "Invoice or document identifier; do not use client/customer numbers, dates, or line item codes.";
+  }
+  if (normalized.includes("client") || normalized.includes("customer")) {
+    return "Client/customer account number; do not use invoice or document identifiers.";
+  }
+  if (normalized.includes("invoice") && normalized.includes("date")) {
+    return "Invoice/document date value only.";
+  }
+  if (normalized.includes("arrived") || normalized.includes("sailed") || normalized.includes("arrival") || normalized.includes("sailing")) {
+    return "Arrival or sailing date value only; do not use the invoice/document date.";
+  }
+  if (normalized.includes("shipper") || normalized.includes("consignee")) {
+    return "Shipper/consignee name or address block, without unrelated vessel, voyage, or amount values.";
+  }
+  if (normalized.includes("vessel") || normalized.includes("ship_name")) {
+    return "Vessel/ship name only; exclude labels and voyage numbers.";
+  }
+  if (normalized.includes("voyage")) {
+    return "Voyage number/code only; exclude labels and vessel names.";
+  }
+  if (normalized.includes("reference") || normalized === "ref") {
+    return "Reference number/code only.";
+  }
+  if (normalized.includes("bl_number") || normalized.includes("bill_of_lading")) {
+    return "Bill of lading number only.";
+  }
+  if (normalized.includes("charge_code")) {
+    return "Charge/account code only; do not use page numbers, quantities, dates, or monetary amounts.";
+  }
+  if (normalized.includes("amount_doc") || normalized.includes("doc_fee")) {
+    return "Monetary amount for the document or bill-of-lading issue fee line only; do not use column headers or totals.";
+  }
+  if (normalized.includes("amount_thc") || normalized.includes("thc")) {
+    return "Monetary amount for the THC/destination charge line only; do not use the final total.";
+  }
+  if (normalized.includes("total")) {
+    return "Final total payable for the requested currency; do not use individual line item amounts.";
+  }
+  if (normalized.includes("container")) {
+    return "Container number only; if a seal number is printed beside it, exclude the seal number.";
+  }
+  if (normalized.includes("seal")) {
+    return "Seal number only; if a container number is printed beside it, exclude the container number.";
+  }
+  return undefined;
+}
+
+function allRequiredFieldsMissing(fieldSpecs: FieldSpec[], reviewRequiredFields: any[]): boolean {
+  const requiredNames = fieldSpecs.filter((spec) => spec.required !== false).map((spec) => spec.name);
+  if (!requiredNames.length) return false;
+  const missing = new Set(
+    reviewRequiredFields
+      .filter((item) => Array.isArray(item.reasons) && item.reasons.includes("missing"))
+      .map((item) => item.field)
+  );
+  return requiredNames.every((name) => missing.has(name));
+}
+
+function readModelFieldValue(fields: Record<string, any>, name: string): any {
+  if (Object.prototype.hasOwnProperty.call(fields, name)) return fields[name];
+  const lower = name.toLowerCase();
+  const foundKey = Object.keys(fields).find((key) => key.toLowerCase() === lower);
+  return foundKey ? fields[foundKey] : undefined;
+}
+
+function normalizeModelValue(value: any): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "object") {
+    const nested = value.value ?? value.text ?? value.raw ?? value.result;
+    if (nested !== undefined) return normalizeModelValue(nested);
+    return "";
+  }
+  const text = String(value).trim();
+  if (!text) return "";
+  if (/^(null|undefined|none|n\/a|na)$/i.test(text)) return "";
+  return text;
+}
+
+function normalizeWordsInfo(raw: any): { text: string; bbox?: any }[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => ({
+      text: String(item?.text || "").trim(),
+      bbox: normalizeWordsBbox(item),
+    }))
+    .filter((item) => item.text);
+}
+
+function normalizeWordsBbox(item: any): any {
+  const loc = item?.location;
+  if (Array.isArray(loc) && loc.length >= 8) {
+    const xs = [Number(loc[0]), Number(loc[2]), Number(loc[4]), Number(loc[6])];
+    const ys = [Number(loc[1]), Number(loc[3]), Number(loc[5]), Number(loc[7])];
+    if ([...xs, ...ys].every((n) => !Number.isNaN(n))) {
+      return { x1: Math.min(...xs), y1: Math.min(...ys), x2: Math.max(...xs), y2: Math.max(...ys) };
+    }
+  }
+  const rect = item?.rotate_rect;
+  if (Array.isArray(rect) && rect.length >= 4) {
+    const cx = Number(rect[0]);
+    const cy = Number(rect[1]);
+    const w = Number(rect[2]);
+    const h = Number(rect[3]);
+    if ([cx, cy, w, h].every((n) => !Number.isNaN(n))) {
+      return { x1: cx - w / 2, y1: cy - h / 2, x2: cx + w / 2, y2: cy + h / 2, angle: Number(rect[4] || 0) };
+    }
+  }
+  return undefined;
+}
+
+function findEvidence(
+  value: string,
+  wordsInfo: { text: string; bbox?: any }[],
+  advancedText: string,
+  documentText: string
+): any {
+  const needle = normalizeForEvidence(value);
+  if (!needle) return { found: false, reason: "empty normalized value" };
+
+  const line = wordsInfo.find((item) => normalizeForEvidence(item.text).includes(needle));
+  if (line) {
+    return {
+      found: true,
+      source: "advanced_recognition.words_info",
+      text: line.text,
+      bbox: line.bbox,
+      match: "normalized_substring",
+    };
+  }
+
+  if (normalizeForEvidence(advancedText).includes(needle)) {
+    return { found: true, source: "advanced_recognition.text", text: value, match: "normalized_substring" };
+  }
+  if (normalizeForEvidence(documentText).includes(needle)) {
+    return { found: true, source: "document_parsing.text", text: value, match: "normalized_substring" };
+  }
+  return { found: false, reason: "value not found in independent OCR evidence" };
+}
+
+function normalizeForEvidence(value: string): string {
+  return String(value || "")
+    .normalize("NFKC")
+    .toUpperCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+function fieldSafetyCheck(
+  value: string,
+  spec: FieldSpec,
+  advancedText: string,
+  documentText: string
+): { passed: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  const name = spec.name.toLowerCase();
+  const compactValue = normalizeForEvidence(value);
+  const readableTokens = spec.name
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length >= 4 && !["number", "date", "code", "amount", "total"].includes(token));
+
+  if (readableTokens.some((token) => compactValue.includes(normalizeForEvidence(token)))) {
+    reasons.push("label_text_in_value");
+  }
+
+  if ((name.includes("vessel") || name.includes("voyage")) && /\b(vessel|voyage)\b/i.test(value)) {
+    reasons.push("label_text_in_value");
+  }
+
+  if (name.includes("charge_code") && /^\d{1,2}$/.test(compactValue)) {
+    reasons.push("ambiguous_short_charge_code");
+  }
+
+  if (name.includes("total")) {
+    const currency = name.includes("usd") ? "usd" : name.includes("hkd") ? "hkd" : "";
+    if (currency && !hasCurrencyTotalEvidence(value, currency, advancedText, documentText)) {
+      reasons.push("weak_total_currency_evidence");
+    }
+  }
+
+  return { passed: reasons.length === 0, reasons };
+}
+
+function hasCurrencyTotalEvidence(value: string, currency: "hkd" | "usd", advancedText: string, documentText: string): boolean {
+  const needle = normalizeForEvidence(value);
+  if (!needle) return false;
+  const currencyTokens = currency === "hkd"
+    ? ["HKD", "HKDOLLAR", "HONGKONGDOLLAR"]
+    : ["USD", "USDOLLAR", "USADOLLAR", "US DOLLAR", "US-DOLLAR"];
+  const totalTokens = ["TOTAL", "BALANCE", "PAYABLE", "OURFAVOUR", "OUR FAVOR", "AMOUNTDUE"];
+  const lines = `${documentText}\n${advancedText}`.split(/\r?\n/);
+  return lines.some((line) => {
+    const normalized = normalizeForEvidence(line);
+    return normalized.includes(needle) &&
+      currencyTokens.some((token) => normalized.includes(normalizeForEvidence(token))) &&
+      totalTokens.some((token) => normalized.includes(normalizeForEvidence(token)));
+  });
+}
+
+async function assessImageQuality(imageBuffer: Buffer): Promise<Record<string, any>> {
+  try {
+    const meta = await sharp(imageBuffer).metadata();
+    const pixels = Number(meta.width || 0) * Number(meta.height || 0);
+    const sampled = await sharp(imageBuffer)
+      .resize({ width: 512, height: 512, fit: "inside", withoutEnlargement: true })
+      .greyscale()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const data = sampled.data;
+    const width = sampled.info.width;
+    let sum = 0;
+    for (const value of data) sum += value;
+    const mean = data.length ? sum / data.length : 0;
+    let variance = 0;
+    let edgeTotal = 0;
+    let edgeCount = 0;
+    for (let i = 0; i < data.length; i++) {
+      const delta = data[i] - mean;
+      variance += delta * delta;
+      if ((i + 1) % width !== 0) {
+        edgeTotal += Math.abs(data[i] - data[i + 1]);
+        edgeCount++;
+      }
+      if (i + width < data.length) {
+        edgeTotal += Math.abs(data[i] - data[i + width]);
+        edgeCount++;
+      }
+    }
+    const contrast = data.length ? Math.sqrt(variance / data.length) : 0;
+    const edgeMean = edgeCount ? edgeTotal / edgeCount : 0;
+    const quality =
+      pixels < 300_000 || contrast < 10 || edgeMean < 2
+        ? "low"
+        : contrast < 18 || edgeMean < 4
+          ? "medium"
+          : "high";
+    return {
+      quality,
+      width: meta.width,
+      height: meta.height,
+      pixels,
+      contrast: Number(contrast.toFixed(2)),
+      edge_mean: Number(edgeMean.toFixed(2)),
+    };
+  } catch (err: any) {
+    return { quality: "unknown", error: err?.message || String(err) };
+  }
+}
+
+function toCostEntry(
+  stage: string,
+  model: string,
+  response: any,
+  estimatedImageTokens: number | undefined,
+  started: number,
+  options: LosslessExtractOptions
+): CostBreakdownEntry {
+  return {
+    stage,
+    model,
+    input_tokens: response.it,
+    output_tokens: response.ot,
+    estimated_image_tokens: response.imageTokens ?? estimatedImageTokens,
+    elapsed_ms: Date.now() - started,
+    cost_policy: options.costPolicy || "quality_first",
+    notes: [
+      `cache_policy=${options.cachePolicy || "auto"}`,
+      "DashScope native Qwen-OCR model-first task",
+    ],
+  };
+}
+
 export function aggregateLosslessPages(
   pageResults: any[],
   rawFields?: any[],
@@ -124,6 +813,10 @@ export function aggregateLosslessPages(
   const pages: LosslessPage[] = [];
   const errors: string[] = [];
   const costBreakdown: CostBreakdownEntry[] = [];
+  const modelExtractedFields: Record<string, any> = {};
+  const fieldEvidence: Record<string, any> = {};
+  const reviewRequiredFields: any[] = [];
+  const qualityReports: any[] = [];
   let apiCalls = 0;
 
   for (const result of pageResults) {
@@ -137,6 +830,12 @@ export function aggregateLosslessPages(
     const parsed = parseJsonObject(String(result.text || "{}"));
     const rawPage = parsed?.schema === "lossless_document_v1" ? parsed.pages?.[0] : parsed;
     pages.push(normalizeLosslessPage({ pages: [rawPage] }, fieldSpecs, pageNumber));
+    if (parsed?.modelExtractedFields) modelExtractedFields[`page_${pageNumber}`] = parsed.modelExtractedFields;
+    if (parsed?.fieldEvidence) fieldEvidence[`page_${pageNumber}`] = parsed.fieldEvidence;
+    if (Array.isArray(parsed?.reviewRequiredFields)) {
+      reviewRequiredFields.push(...parsed.reviewRequiredFields.map((item: any) => ({ page: pageNumber, ...item })));
+    }
+    if (parsed?.qualityReport) qualityReports.push(parsed.qualityReport);
     if (Array.isArray(parsed?.costBreakdown)) costBreakdown.push(...parsed.costBreakdown);
     apiCalls += Number(parsed?.stats?.totalApiCalls || 1);
   }
@@ -148,7 +847,18 @@ export function aggregateLosslessPages(
     schema: "lossless_document_v1",
     source_path: sourcePath,
     pages,
-    finalJson: buildFinalJson(pages, fieldSpecs),
+    finalJson: buildAcceptedFinalJson(pages, fieldSpecs),
+    modelExtractedFields: Object.keys(modelExtractedFields).length ? modelExtractedFields : undefined,
+    fieldEvidence: Object.keys(fieldEvidence).length ? fieldEvidence : undefined,
+    reviewRequiredFields: reviewRequiredFields.length ? reviewRequiredFields : undefined,
+    qualityReport: qualityReports.length ? {
+      pages: qualityReports,
+      hallucination_risk: qualityReports.some((q) => q?.hallucination_risk === "high")
+        ? "high"
+        : qualityReports.some((q) => q?.hallucination_risk === "medium")
+          ? "medium"
+          : "low",
+    } : undefined,
     costBreakdown: costBreakdown.length ? costBreakdown : undefined,
     review_required: pages.some((p) => p.review_required) || !qualityGate.passed,
     quality_gate: qualityGate,
@@ -311,6 +1021,26 @@ function buildFinalJson(pages: LosslessPage[], fieldSpecs: FieldSpec[]): Record<
       candidates: perPage,
       source: "lossless_document_v1",
       ...(spec.required !== false && (!best || !fieldValueLooksValid(best, spec) || conflict) ? { required_unverified: true } : {}),
+    };
+  }
+  return finalJson;
+}
+
+function buildAcceptedFinalJson(pages: LosslessPage[], fieldSpecs: FieldSpec[]): Record<string, any> {
+  const finalJson: Record<string, any> = {};
+  for (const spec of fieldSpecs) {
+    const accepted = pages
+      .map((page) => ({ page: page.page, ...(page.mapped_fields[spec.name] || {}) }))
+      .filter((entry) => entry.verified === true && String(entry.value || "").trim());
+    const values = uniqueStrings(accepted.map((entry) => String(entry.value || "")).filter(Boolean));
+    if (values.length !== 1) continue;
+    const chosen = accepted.find((entry) => String(entry.value || "").trim() === values[0]) || accepted[0];
+    finalJson[spec.name] = {
+      ...chosen,
+      value: values[0],
+      verified: true,
+      needs_review: false,
+      source: chosen.source || "lossless_document_v1",
     };
   }
   return finalJson;

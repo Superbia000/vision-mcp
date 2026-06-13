@@ -25,6 +25,43 @@ export interface VideoChatParams extends ChatParams {
   nframes?: number;
 }
 
+export type NativeOcrTask =
+  | "text_recognition"
+  | "key_information_extraction"
+  | "document_parsing"
+  | "table_parsing"
+  | "formula_recognition"
+  | "multi_lan"
+  | "advanced_recognition";
+
+export interface NativeOcrParams {
+  model: string;
+  image: Buffer;
+  mime: string;
+  task: NativeOcrTask;
+  text?: string;
+  resultSchema?: Record<string, string>;
+  max_tokens?: number;
+  min_pixels?: number;
+  max_pixels?: number;
+  enable_rotate?: boolean;
+  temperature?: number;
+  top_p?: number;
+  logprobs?: boolean;
+  top_logprobs?: number;
+}
+
+export interface NativeOcrResult {
+  task: NativeOcrTask;
+  text: string;
+  ocrResult?: any;
+  raw: any;
+  requestId?: string;
+  it?: number;
+  ot?: number;
+  imageTokens?: number;
+}
+
 export abstract class VisionProvider {
   abstract readonly type: "qwen" | "openai";
   abstract chat(params: ChatParams): Promise<VisionResponse>;
@@ -33,6 +70,14 @@ export abstract class VisionProvider {
   abstract createBatch(jsonlContent: string): Promise<string>;
   abstract getBatch(batchId: string): Promise<any>;
   abstract getBatchResults(outputFileId: string): Promise<string>;
+
+  supportsNativeOcr(): boolean {
+    return false;
+  }
+
+  async nativeOcr(_params: NativeOcrParams): Promise<NativeOcrResult> {
+    throw new Error("Provider does not support DashScope native OCR");
+  }
 
   /** Build provider-specific chat completion params */
   protected buildChatParams(overrides: Partial<ChatParams>): any {

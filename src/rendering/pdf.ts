@@ -4,11 +4,12 @@
  */
 
 import * as mupdf from "mupdf";
+import { createHash } from "crypto";
+import { readFileSync, statSync } from "fs";
 import type { ExtractedImage } from "../config/types.js";
 import {
   MAX_PAGE_MEGAPIXELS,
   MAX_IMAGE_WIDTH,
-  MIN_PDF_DPI,
   IMAGE_MAX_DIMENSION,
   ENABLE_PREPROCESSING, PREPROCESS_WITH_THINKING,
   RENDER_CACHE_ENABLED,
@@ -23,11 +24,37 @@ const nativeScaleCache = new Map<string, number>();
 // v8.3: Per-PDF type cache (image-based vs text-based)
 const pdfTypeCache = new Map<string, "image" | "text">();
 
-// Render cache keyed by path+page+maxWidth
+// Render cache keyed by file hash, page, render scale, preprocessing, and pixel controls.
 const renderCache = new LRUCache<ExtractedImage>(RENDER_CACHE_MAX);
+const fileHashCache = new Map<string, { sig: string; hash: string }>();
 
-function cacheKey(path: string, pageNum: number, maxWidth: number, preprocess: boolean = false, skip: boolean = false): string {
-  return `${path}::${pageNum}::${maxWidth}::pp${preprocess ? 1 : 0}::sk${skip ? 1 : 0}`;
+export interface RenderPageOptions {
+  renderScale?: number;
+  maxPixels?: number;
+  losslessMode?: boolean;
+}
+
+function fileCacheId(path: string): string {
+  const stat = statSync(path);
+  const sig = `${stat.size}:${stat.mtimeMs}`;
+  const cached = fileHashCache.get(path);
+  if (cached?.sig === sig) return cached.hash;
+  const hash = createHash("sha1").update(readFileSync(path)).digest("hex").slice(0, 16);
+  fileHashCache.set(path, { sig, hash });
+  return hash;
+}
+
+function cacheKey(path: string, pageNum: number, maxWidth: number, preprocess: boolean = false, skip: boolean = false, options: RenderPageOptions = {}): string {
+  return [
+    fileCacheId(path),
+    pageNum,
+    maxWidth,
+    `pp${preprocess ? 1 : 0}`,
+    `sk${skip ? 1 : 0}`,
+    `rs${options.renderScale ?? "auto"}`,
+    `mp${options.maxPixels ?? "auto"}`,
+    `ll${options.losslessMode === false ? 0 : 1}`,
+  ].join("::");
 }
 
 // v8.3: Export for external use (pdf-analyze needs it)
@@ -93,7 +120,7 @@ async function detectPdfType(
  *   Text requires higher scale for legibility.
  *   Use the scale where bpp stabilizes.
  *
- * Falls back to 4x (288 DPI) for text-based, 1x for image-based.
+ * Falls back to 4x render scale for text-based, 1x for image-based.
  */
 async function detectNativeScale(
   page: any,
@@ -141,11 +168,12 @@ export async function renderPageSmart(
   maxWidth: number,
   preprocessForOCR2: boolean = false,
   useAggressive: boolean = false,
-  skipPreprocess: boolean = false
+  skipPreprocess: boolean = false,
+  options: RenderPageOptions = {}
 ): Promise<ExtractedImage> {
   // Check cache
   if (RENDER_CACHE_ENABLED) {
-    const key = cacheKey(pdfPath, pageNum, maxWidth, preprocessForOCR2, skipPreprocess);
+    const key = cacheKey(pdfPath, pageNum, maxWidth, preprocessForOCR2, skipPreprocess, options);
     const cached = renderCache.get(key);
     if (cached) {
       console.error(`[render] Cache hit: page ${pageNum}`);
@@ -177,15 +205,16 @@ export async function renderPageSmart(
   if (optimalScale === undefined) {
     optimalScale = await detectNativeScale(page, pageW, pageH, pdfType);
     nativeScaleCache.set(pdfPath, optimalScale);
-    const dpiEquivalent = (optimalScale * 72).toFixed(0);
     console.error(
-      `[render] PDF type=${pdfType}, native scale=${optimalScale.toFixed(1)}x (${dpiEquivalent} DPI)`
+      `[render] PDF type=${pdfType}, native scale=${optimalScale.toFixed(1)}x`
     );
   }
 
   // v8.3: Compute render scale based on PDF type
   let scale: number;
-  if (pdfType === "image") {
+  if (options.renderScale && options.renderScale > 0 && pdfType !== "image") {
+    scale = options.renderScale;
+  } else if (pdfType === "image") {
     // Image-based: use native resolution, maxWidth acts as absolute cap only
     // Never downscale below 80% of native resolution for image-based PDFs
     const nativeWidth = pageW * optimalScale;
@@ -213,6 +242,13 @@ export async function renderPageSmart(
       } else {
         scale = IMAGE_MAX_DIMENSION / pageH;
       }
+    }
+  }
+
+  if (options.maxPixels && options.maxPixels > 0) {
+    const rawPixels = pageW * scale * pageH * scale;
+    if (rawPixels > options.maxPixels) {
+      scale = Math.sqrt(options.maxPixels / (pageW * pageH));
     }
   }
 
@@ -258,7 +294,7 @@ export async function renderPageSmart(
 
   // Cache the result
   if (RENDER_CACHE_ENABLED) {
-    renderCache.set(cacheKey(pdfPath, pageNum, maxWidth), result);
+    renderCache.set(cacheKey(pdfPath, pageNum, maxWidth, preprocessForOCR2, skipPreprocess, options), result);
   }
 
   return result;

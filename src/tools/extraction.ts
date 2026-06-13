@@ -118,6 +118,11 @@ export async function handleExtractFields(
         maxUnverifiedRequiredFields: typeof args.max_unverified_required_fields === "number" ? args.max_unverified_required_fields : undefined,
         costPolicy: args.cost_policy,
         cachePolicy: args.cache_policy,
+        providerMode: args.provider_mode,
+        extractionStyle: args.extraction_style,
+        verificationMode: args.verification_mode,
+        returnEvidence: args.return_evidence,
+        returnQualityReport: args.return_quality_report,
       });
       return JSON.stringify(result, null, 2);
     }

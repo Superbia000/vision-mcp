@@ -5,19 +5,33 @@
 import { SUPPORTED_IMAGE_EXTS, SUPPORTED_VIDEO_EXTS } from "../config/constants.js";
 
 export function parsePageRange(raw: string, totalPages: number): number[] {
+  return parsePageRangeDetailed(raw, totalPages).pages;
+}
+
+export function parsePageRangeDetailed(raw: string, totalPages: number): { pages: number[]; error?: string } {
   const pages: number[] = [];
   for (const part of raw.split(",")) {
     const t = part.trim();
+    if (!t) continue;
     if (t.includes("-")) {
       const [s, e] = t.split("-");
-      for (let i = Math.max(1, +s); i <= Math.min(totalPages, +e); i++)
+      const start = Number(s);
+      const end = Number(e);
+      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || start > totalPages) {
+        return { pages: [], error: `No valid pages in "${raw}" (total: ${totalPages})` };
+      }
+      for (let i = Math.max(1, start); i <= Math.min(totalPages, end); i++)
         pages.push(i);
     } else {
-      const n = +t;
+      const n = Number(t);
+      if (!Number.isInteger(n) || n < 1 || n > totalPages) {
+        return { pages: [], error: `No valid pages in "${raw}" (total: ${totalPages})` };
+      }
       if (n >= 1 && n <= totalPages) pages.push(n);
     }
   }
-  return [...new Set(pages)].sort((a, b) => a - b);
+  const unique = [...new Set(pages)].sort((a, b) => a - b);
+  return unique.length ? { pages: unique } : { pages: [], error: `No valid pages in "${raw}" (total: ${totalPages})` };
 }
 
 export function extToMime(ext: string): string {

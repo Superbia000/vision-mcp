@@ -68,6 +68,8 @@ export interface BatchResult {
   requested: number;
   completed: number;
   failed: number;
+  pending?: boolean;
+  output_file_id?: string;
   errors?: any[];
   results?: PageResult[];
 }
@@ -162,6 +164,10 @@ export interface LosslessDocumentResult {
   source_path?: string;
   pages: LosslessPage[];
   finalJson: Record<string, any>;
+  modelExtractedFields?: Record<string, any>;
+  fieldEvidence?: Record<string, any>;
+  reviewRequiredFields?: any[];
+  qualityReport?: Record<string, any>;
   costBreakdown?: CostBreakdownEntry[];
   review_required: boolean;
   quality_gate: { passed: boolean; reason?: string };
@@ -257,7 +263,6 @@ export interface PreprocessOptions {
   enhanceContrast?: boolean;
   sharpen?: boolean;
   grayscale?: boolean;
-  targetDpi?: number;
   removeBackground?: boolean;
   quality?: number;
   /** v7: Specific document type hint */

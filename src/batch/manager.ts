@@ -12,6 +12,27 @@ import { renderPageSmart } from "../rendering/pdf.js";
 import { optimizeForVision } from "../rendering/image.js";
 import type { PageResult, BatchResult } from "../config/types.js";
 
+export interface BatchRenderOptions {
+  renderScale?: number;
+  maxPixels?: number;
+  minPixels?: number;
+  losslessMode?: boolean;
+}
+
+function imageContent(url: string, renderOptions: BatchRenderOptions): any {
+  const item: any = { type: "image_url", image_url: { url } };
+  if (renderOptions.minPixels !== undefined) item.min_pixels = renderOptions.minPixels;
+  if (renderOptions.maxPixels !== undefined) item.max_pixels = renderOptions.maxPixels;
+  return item;
+}
+
+function imageExtension(mime: string): string {
+  if (mime === "image/png") return "png";
+  if (mime === "image/jpeg") return "jpg";
+  if (mime === "image/webp") return "webp";
+  return "bin";
+}
+
 /** Submit a single batch job for a range of pages */
 export async function submitBatchJob(
   provider: VisionProvider,
@@ -22,7 +43,8 @@ export async function submitBatchJob(
   imgQuality: number,
   maxImageWidth: number,
   enableThinking?: boolean,
-  thinkingBudget?: number
+  thinkingBudget?: number,
+  renderOptions: BatchRenderOptions = {}
 ): Promise<string> {
   const tmpDir = join(
     tmpdir(),
@@ -43,11 +65,23 @@ export async function submitBatchJob(
 
   for (const pn of pages) {
     try {
-      const img = await renderPageSmart(pdfPath, pn, maxImageWidth);
-      const opt = await optimizeForVision(img, imgQuality, maxImageWidth);
+      const img = await renderPageSmart(pdfPath, pn, maxImageWidth, false, false, false, {
+        renderScale: renderOptions.renderScale,
+        maxPixels: renderOptions.maxPixels,
+        losslessMode: renderOptions.losslessMode !== false,
+      });
+      const opt = await optimizeForVision(img, {
+        quality: imgQuality,
+        maxWidth: maxImageWidth,
+        preferLossless: renderOptions.losslessMode !== false,
+      });
 
       // Qwen uses base64 inline, others use ms://
       if (provider.type === "qwen") {
+        const imageItem = imageContent(
+          `data:${opt.mime};base64,${opt.buffer.toString("base64")}`,
+          renderOptions
+        );
         jsonlLines.push(
           JSON.stringify({
             custom_id: `page_${pn}`,
@@ -59,12 +93,7 @@ export async function submitBatchJob(
                 {
                   role: "user",
                   content: [
-                    {
-                      type: "image_url",
-                      image_url: {
-                        url: `data:${opt.mime};base64,${opt.buffer.toString("base64")}`,
-                      },
-                    },
+                    imageItem,
                     { type: "text", text: `[Page ${pn}]\n${prompt}` },
                   ],
                 },
@@ -73,7 +102,7 @@ export async function submitBatchJob(
           })
         );
       } else {
-        const tmpFile = join(tmpDir, `page_${pn}.webp`);
+        const tmpFile = join(tmpDir, `page_${pn}.${imageExtension(opt.mime)}`);
         writeFileSync(tmpFile, opt.buffer);
         const uploaded = await (provider as any).getClient().files.create({
           file: createReadStream(tmpFile),
@@ -140,7 +169,8 @@ export async function submitBatchedJobs(
   imgQuality: number,
   maxImageWidth: number,
   enableThinking?: boolean,
-  thinkingBudget?: number
+  thinkingBudget?: number,
+  renderOptions: BatchRenderOptions = {}
 ): Promise<{ batchIds: string[]; chunks: number }> {
   const chunks = chunkArray(pages, BATCH_MAX_PAGES);
   const batchIds: string[] = [];
@@ -155,7 +185,8 @@ export async function submitBatchedJobs(
       imgQuality,
       maxImageWidth,
       enableThinking,
-      thinkingBudget
+      thinkingBudget,
+      renderOptions
     );
     batchIds.push(bid);
     console.error(`[batch] Submitted: ${bid} (${chunk.length} pages)`);
@@ -179,6 +210,7 @@ export async function getBatchResults(
   };
 
   if (batch.errors) result.errors = batch.errors;
+  if (batch.output_file_id) result.output_file_id = batch.output_file_id;
 
   if (batch.status === "completed" && batch.output_file_id) {
     const text = await provider.getBatchResults(batch.output_file_id);
@@ -204,6 +236,8 @@ export async function getBatchResults(
         return { page: 0, success: false, text: "", error: "parse error" } as PageResult;
       }
     });
+  } else {
+    result.pending = batch.status === "in_progress" || batch.status === "validating" || batch.status === "queued";
   }
 
   return result;

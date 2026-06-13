@@ -49,6 +49,8 @@ export async function handleBatchStatusAll(provider: VisionProvider, args: any):
             requested: batch.request_counts?.total || 0,
             completed: batch.request_counts?.completed || 0,
             failed: batch.request_counts?.failed || 0,
+            pending: batch.status === "queued" || batch.status === "validating" || batch.status === "in_progress",
+            output_file_id: batch.output_file_id,
             errors: batch.errors || null,
           };
         } catch (err: any) {
@@ -59,8 +61,8 @@ export async function handleBatchStatusAll(provider: VisionProvider, args: any):
     const summary = {
       total_batches: results.length,
       completed: results.filter((r) => r.status === "completed").length,
-      in_progress: results.filter((r) => r.status === "in_progress" || r.status === "validating").length,
-      failed: results.filter((r) => r.status === "failed" || r.status === "error" || r.status === "expired").length,
+      in_progress: results.filter((r) => r.status === "queued" || r.status === "in_progress" || r.status === "validating").length,
+      failed: results.filter((r) => r.status === "failed" || r.status === "error" || r.status === "expired" || r.status === "cancelled").length,
       total_requested: results.reduce((s, r) => s + (r.requested || 0), 0),
       total_completed_req: results.reduce((s, r) => s + (r.completed || 0), 0),
     };
@@ -96,15 +98,21 @@ export async function handleEstimateTokens(args: any): Promise<string> {
 
     if (ext === ".pdf") {
       const { getPdfPageCount, renderPageSmart } = await import("../rendering/pdf.js");
-      const { parsePageRange } = await import("../utils/helpers.js");
+      const { parsePageRangeDetailed } = await import("../utils/helpers.js");
       const { estimateImageTokens } = await import("../utils/tokens.js");
       const total = await getPdfPageCount(filePath);
-      const nums = parsePageRange(pagesRaw, total);
+      const parsed = parsePageRangeDetailed(pagesRaw, total);
+      if (parsed.error) return JSON.stringify({ error: parsed.error });
+      const nums = parsed.pages;
       let totalTokens = 0;
       const perPage: any[] = [];
       const sampleSize = Math.min(nums.length, 10);
       for (let i = 0; i < sampleSize; i++) {
-        const img = await renderPageSmart(filePath, nums[i], imgMaxWidth);
+        const img = await renderPageSmart(filePath, nums[i], imgMaxWidth, false, false, false, {
+          renderScale: args.render_scale,
+          maxPixels: args.max_pixels,
+          losslessMode: args.lossless_mode !== false,
+        });
         const tokens = estimateImageTokens(img.width, img.height);
         perPage.push({ page: nums[i], dimensions: `${img.width}x${img.height}`, estimated_tokens: tokens });
         totalTokens += tokens;
@@ -135,4 +143,3 @@ export async function handleEstimateTokens(args: any): Promise<string> {
     return JSON.stringify({ error: err.message });
   }
 }
-
