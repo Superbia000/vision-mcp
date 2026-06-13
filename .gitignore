@@ -1,0 +1,31 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+
+# Local generated outputs and scratch artifacts
+dist.backup-*/
+src.backup-*/
+*.backup-*
+*.before-*
+.backups/
+deep-test-results*/
+preprocessed/
+temp/
+*.log
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.pdf
+$null
+
+# Local API/debug scripts. Several historical scratch scripts contain
+# hard-coded test credentials and must never be uploaded.
+*.mjs
+fix-router.js
+batch_preprocess.py
+preprocess_invert.py
+codex-config-snippet.toml
+comparison-results.json
+image-comparison-results.json

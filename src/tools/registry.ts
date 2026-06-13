@@ -1,0 +1,99 @@
+import { MODEL } from "../config/constants.js";
+
+export const PUBLIC_TOOLS = [
+  {
+    name: "vision_inspect",
+    description: `Inspect PDF/image/video metadata, page count, dimensions, PDF type, token estimates, and recommended processing strategy for ${MODEL}.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_path: { type: "string", description: "Absolute path to a PDF, image, or video file." },
+        pages: { type: "string", description: "PDF page range, e.g. 1-5,10. Default: page 1 for estimates." },
+        fps: { type: "number", description: "Video FPS used for token estimate." },
+        max_image_width: { type: "number", description: "Expected render/resize width for estimate." },
+        accuracy_mode: { type: "string", description: "fast | balanced | max. Default: balanced." },
+      },
+      required: ["file_path"],
+    },
+  },
+  {
+    name: "vision_prepare",
+    description: "Render PDF pages or apply OCR-oriented preprocessing for images. Supports auto/light/table/scan/photo/handwriting/negative modes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_path: { type: "string", description: "Absolute path to a PDF or image file." },
+        pages: { type: "string", description: "PDF page range. Default: page 1." },
+        mode: { type: "string", description: "auto | light | table | scan | photo | handwriting | negative." },
+        output_path: { type: "string", description: "Optional output image path. Multiple PDF pages get numbered suffixes." },
+        return_base64: { type: "boolean", description: "Return base64 image payload. Default false when output_path is set." },
+      },
+      required: ["file_path"],
+    },
+  },
+  {
+    name: "vision_analyze",
+    description: "Analyze PDF/image/video content with automatic routing across realtime, multi-image, chunked, and batch-capable paths.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_path: { type: "string", description: "Absolute path to a PDF, image, or video file." },
+        prompt: { type: "string", description: "Analysis, OCR, summarization, or table extraction prompt." },
+        pages: { type: "string", description: "PDF page range. Default: all pages." },
+        media_type: { type: "string", description: "auto | image | pdf | video." },
+        strategy: { type: "string", description: "auto | realtime | multi_image | chunked | batch." },
+        accuracy_mode: { type: "string", description: "fast | balanced | max. Default: balanced." },
+        concurrency: { type: "number" },
+        chunk_size: { type: "number" },
+        temperature: { type: "number" },
+        top_p: { type: "number" },
+        enable_thinking: { type: "boolean" },
+        thinking_budget: { type: "number" },
+        vl_high_resolution_images: { type: "boolean" },
+      },
+      required: ["file_path", "prompt"],
+    },
+  },
+  {
+    name: "vision_extract",
+    description: "Structured document field extraction for invoices, forms, tables, handwriting, IDs, and bank/shipping documents with uncertainty review flags.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_path: { type: "string", description: "Absolute path to a PDF or image file." },
+        fields: { type: "array", items: { type: "object" }, description: "Field specs with name, label_pattern, format_hint, position_hint, examples, and validation hints." },
+        pages: { type: "string", description: "PDF page range. Default: page 1." },
+        document_type: { type: "string", description: "auto | scan | table | photo | handwriting | mixed." },
+        validation_rules: { type: "array", items: { type: "object" } },
+        accuracy_mode: { type: "string", description: "fast | balanced | max. Default: balanced." },
+        ocr_verify: { type: "boolean", description: "Enable OCR verification for uncertain fields. Default true except fast mode." },
+        self_consistency_votes: { type: "number" },
+        return_evidence: { type: "boolean", description: "Return evidence/confidence metadata. Default true." },
+        cost_policy: { type: "string", description: "quality_first | prefer_batch | realtime_only. Cost routing never downgrades final OCR quality." },
+        cache_policy: { type: "string", description: "auto | off | explicit. Controls cache metadata and prompt ordering hints." },
+        return_cost_breakdown: { type: "boolean", description: "Return per-stage token/cost telemetry. Default true." },
+        budget_hint_usd: { type: "number", description: "Advisory cost hint only; does not cap quality checks." },
+        max_unverified_required_fields: { type: "number", description: "Default 0. Mark result as review-needed if required fields remain unverified." },
+      },
+      required: ["file_path", "fields"],
+    },
+  },
+  {
+    name: "vision_jobs",
+    description: "Submit, inspect, cancel, or retrieve async batch jobs. Batch is used only when provider/region/model support is known or explicitly forced.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", description: "submit | status | status_all | cancel | results | list." },
+        file_path: { type: "string", description: "PDF path for submit." },
+        job_id: { type: "string", description: "Batch/job id for status, cancel, or results." },
+        job_ids: { type: "array", items: { type: "string" }, description: "Batch/job ids for status_all." },
+        pages: { type: "string" },
+        prompt: { type: "string" },
+        fields: { type: "array", items: { type: "object" } },
+        batch_policy: { type: "string", description: "auto | force | disable." },
+      },
+      required: ["action"],
+    },
+  },
+];
