@@ -23,7 +23,7 @@ export function enhancePrompt(prompt: string): string {
   let enhanced = prompt;
 
   if (IS_QWEN && !/qwenvl/i.test(prompt)) {
-    const docKeywords = /OCR|extract|document|table|invoice|receipt/i;
+    const docKeywords = /OCR|extract|document|table|parse|markdown|html/i;
     if (docKeywords.test(prompt)) {
       console.error(`[prompt] Qwen document extraction - using optimized prompt`);
     }

@@ -22,6 +22,11 @@ import { estimateImageTokens, summarizeCost } from "../runtime/cost.js";
 import { buildLosslessDocumentPrompt } from "./prompts.js";
 import { fieldValueLooksValid } from "./router.js";
 import { buildUniversalSemanticResult, type SemanticOptions } from "./semantic.js";
+import {
+  buildFailedUniversalPage,
+  extractUniversalDocumentPage,
+  mergeUniversalDocumentResults,
+} from "./universal-model.js";
 
 type Confidence = "high" | "medium" | "low";
 
@@ -50,6 +55,14 @@ export interface LosslessExtractOptions {
   outputGrain?: string;
   integrationMode?: string;
   extractAllFields?: boolean;
+  renderScale?: number;
+  maxApiConcurrency?: number;
+  renderConcurrency?: number;
+  outputDir?: string;
+  saveOutputs?: boolean;
+  exportFormats?: string[];
+  writerMode?: string;
+  resumeFrom?: string;
 }
 
 export function toFieldSpecs(rawFields?: any[]): FieldSpec[] {
@@ -72,6 +85,8 @@ export async function extractLosslessDocument(
   rawFields?: any[],
   options: LosslessExtractOptions = {}
 ): Promise<LosslessDocumentResult> {
+  return extractUniversalDocumentPage(provider, imageBuffer, imageMime, rawFields, options);
+
   const providerMode = options.providerMode || "auto";
   const extractionStyle = options.extractionStyle || "model_first";
   if (
@@ -385,7 +400,7 @@ async function runModelKeyExtraction(
       cost_policy: options.costPolicy || "quality_first",
       notes: [
         `cache_policy=${options.cachePolicy || "auto"}`,
-        "model-first native Qwen-OCR result_schema extraction",
+        "legacy native result_schema extraction",
       ],
     } satisfies CostBreakdownEntry,
     enumerable: false,
@@ -537,52 +552,7 @@ function buildModelFirstResultSchema(fieldSpecs: FieldSpec[]): Record<string, st
 }
 
 function semanticHintForField(name: string): string | undefined {
-  const normalized = name.toLowerCase().replace(/[^a-z0-9]+/g, "_");
-  if (normalized.includes("invoice") && normalized.includes("number")) {
-    return "Invoice or document identifier; do not use client/customer numbers, dates, or line item codes.";
-  }
-  if (normalized.includes("client") || normalized.includes("customer")) {
-    return "Client/customer account number; do not use invoice or document identifiers.";
-  }
-  if (normalized.includes("invoice") && normalized.includes("date")) {
-    return "Invoice/document date value only.";
-  }
-  if (normalized.includes("arrived") || normalized.includes("sailed") || normalized.includes("arrival") || normalized.includes("sailing")) {
-    return "Arrival or sailing date value only; do not use the invoice/document date.";
-  }
-  if (normalized.includes("shipper") || normalized.includes("consignee")) {
-    return "Shipper/consignee name or address block, without unrelated vessel, voyage, or amount values.";
-  }
-  if (normalized.includes("vessel") || normalized.includes("ship_name")) {
-    return "Vessel/ship name only; exclude labels and voyage numbers.";
-  }
-  if (normalized.includes("voyage")) {
-    return "Voyage number/code only; exclude labels and vessel names.";
-  }
-  if (normalized.includes("reference") || normalized === "ref") {
-    return "Reference number/code only.";
-  }
-  if (normalized.includes("bl_number") || normalized.includes("bill_of_lading")) {
-    return "Bill of lading number only.";
-  }
-  if (normalized.includes("charge_code")) {
-    return "Charge/account code only; do not use page numbers, quantities, dates, or monetary amounts.";
-  }
-  if (normalized.includes("amount_doc") || normalized.includes("doc_fee")) {
-    return "Monetary amount for the document or bill-of-lading issue fee line only; do not use column headers or totals.";
-  }
-  if (normalized.includes("amount_thc") || normalized.includes("thc")) {
-    return "Monetary amount for the THC/destination charge line only; do not use the final total.";
-  }
-  if (normalized.includes("total")) {
-    return "Final total payable for the requested currency; do not use individual line item amounts.";
-  }
-  if (normalized.includes("container")) {
-    return "Container number only; if a seal number is printed beside it, exclude the seal number.";
-  }
-  if (normalized.includes("seal")) {
-    return "Seal number only; if a container number is printed beside it, exclude the container number.";
-  }
+  void name;
   return undefined;
 }
 
@@ -691,8 +661,9 @@ function fieldSafetyCheck(
   advancedText: string,
   documentText: string
 ): { passed: boolean; reasons: string[] } {
+  void advancedText;
+  void documentText;
   const reasons: string[] = [];
-  const name = spec.name.toLowerCase();
   const compactValue = normalizeForEvidence(value);
   const readableTokens = spec.name
     .toLowerCase()
@@ -701,21 +672,6 @@ function fieldSafetyCheck(
 
   if (readableTokens.some((token) => compactValue.includes(normalizeForEvidence(token)))) {
     reasons.push("label_text_in_value");
-  }
-
-  if ((name.includes("vessel") || name.includes("voyage")) && /\b(vessel|voyage)\b/i.test(value)) {
-    reasons.push("label_text_in_value");
-  }
-
-  if (name.includes("charge_code") && /^\d{1,2}$/.test(compactValue)) {
-    reasons.push("ambiguous_short_charge_code");
-  }
-
-  if (name.includes("total")) {
-    const currency = name.includes("usd") ? "usd" : name.includes("hkd") ? "hkd" : "";
-    if (currency && !hasCurrencyTotalEvidence(value, currency, advancedText, documentText)) {
-      reasons.push("weak_total_currency_evidence");
-    }
   }
 
   return { passed: reasons.length === 0, reasons };
@@ -806,7 +762,7 @@ function toCostEntry(
     cost_policy: options.costPolicy || "quality_first",
     notes: [
       `cache_policy=${options.cachePolicy || "auto"}`,
-      "DashScope native Qwen-OCR model-first task",
+      "legacy native model-first task",
     ],
   };
 }
@@ -819,6 +775,7 @@ export function aggregateLosslessPages(
 ): LosslessDocumentResult {
   const started = Date.now();
   const fieldSpecs = toFieldSpecs(rawFields);
+  const universalResults: LosslessDocumentResult[] = [];
   const pages: LosslessPage[] = [];
   const errors: string[] = [];
   const costBreakdown: CostBreakdownEntry[] = [];
@@ -831,12 +788,21 @@ export function aggregateLosslessPages(
   for (const result of pageResults) {
     const pageNumber = Number(result?.page || pages.length + 1);
     if (!result?.success) {
-      errors.push(`Page ${pageNumber}: ${result?.error || "unknown error"}`);
+      const message = `Page ${pageNumber}: ${result?.error || "unknown error"}`;
+      errors.push(message);
+      universalResults.push(buildFailedUniversalPage(pageNumber, message, {
+        ...semanticOptions,
+        sourcePath,
+      }));
       pages.push(emptyPage(pageNumber, `Page failed: ${result?.error || "unknown error"}`));
       continue;
     }
 
     const parsed = parseJsonObject(String(result.text || "{}"));
+    if (parsed?.universal_schema === "universal_document_semantics_v2") {
+      universalResults.push(parsed);
+      continue;
+    }
     const rawPage = parsed?.schema === "lossless_document_v1" ? parsed.pages?.[0] : parsed;
     pages.push(normalizeLosslessPage({ pages: [rawPage] }, fieldSpecs, pageNumber));
     if (parsed?.modelExtractedFields) modelExtractedFields[`page_${pageNumber}`] = parsed.modelExtractedFields;
@@ -847,6 +813,13 @@ export function aggregateLosslessPages(
     if (parsed?.qualityReport) qualityReports.push(parsed.qualityReport);
     if (Array.isArray(parsed?.costBreakdown)) costBreakdown.push(...parsed.costBreakdown);
     apiCalls += Number(parsed?.stats?.totalApiCalls || 1);
+  }
+
+  if (universalResults.length) {
+    return mergeUniversalDocumentResults(universalResults, {
+      ...semanticOptions,
+      sourcePath,
+    });
   }
 
   pages.sort((a, b) => a.page - b.page);

@@ -67,7 +67,7 @@ export const TOKEN_BUDGET_ENABLED = process.env.VISION_TOKEN_BUDGET_ENABLED === 
 export const TOKEN_BUDGET_K = Number(process.env.VISION_TOKEN_BUDGET_K) || 32;
 
 // OCR & Extraction
-export const OCR_MODEL = process.env.VISION_OCR_MODEL || "qwen-vl-ocr-2025-11-20";
+export const OCR_MODEL = process.env.VISION_OCR_MODEL || MODEL;
 export const OCR_BASE_URL = process.env.VISION_OCR_BASE_URL || "";
 export const ENABLE_STRUCTURED_OUTPUT = process.env.VISION_STRUCTURED_OUTPUT !== "false";
 export const FIX_MODEL = process.env.VISION_FIX_MODEL || "qwen3-vl-flash";
@@ -211,7 +211,7 @@ export const L4_ONLY_HIGH_CE = process.env.VISION_L4_ONLY_HIGH_CE !== "false";
 export const SECOND_PASS_ENABLED = process.env.VISION_SECOND_PASS_ENABLED === "true";  // v9: disabled by default
 
 /** Model for second-pass correction (default qwen3-vl-flash for speed/cost) */
-export const SECOND_PASS_MODEL = process.env.VISION_SECOND_PASS_MODEL || "qwen3-vl-flash";
+export const SECOND_PASS_MODEL = process.env.VISION_SECOND_PASS_MODEL || MODEL;
 
 // ---- v8.3: Image-based PDF Optimization ----
 

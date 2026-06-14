@@ -64,7 +64,7 @@ export function chunkArray<T>(arr: T[], size: number): T[][] {
 }
 
 export function isDocExtractionPrompt(prompt: string): boolean {
-  return /提取|OCR|識別|掃描|parse|extract|document|表格|table|發票|invoice|收據|receipt|pdf|markdown|html|qwenvl/i.test(prompt);
+  return /提取|OCR|識別|掃描|parse|extract|document|表格|table|pdf|markdown|html|qwenvl/i.test(prompt);
 }
 
 export function isHandwritingPrompt(prompt: string): boolean {

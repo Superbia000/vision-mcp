@@ -17,6 +17,10 @@ export interface SemanticOptions {
   maxApiConcurrency?: number;
   renderConcurrency?: number;
   writerMode?: string;
+  outputDir?: string;
+  saveOutputs?: boolean;
+  exportFormats?: string[];
+  resumeFrom?: string;
 }
 
 interface NormalizedAttentionField {
@@ -326,27 +330,15 @@ function buildOrphanValues(rawText: string, candidates: any[], source: any): any
 }
 
 function classifyDocument(rawText: string, tables: any[], domainHint?: string): any {
-  const text = normalizeComparable(rawText);
-  const scores: Record<string, number> = {
-    bank_statement: score(text, ["statement", "account", "balance", "deposit", "withdrawal", "cheque", "transaction", "bank"]),
-    invoice: score(text, ["invoice", "amount", "total", "client", "customer", "date"]),
-    shipping_document: score(text, ["vessel", "voyage", "container", "billoflading", "port", "receipt", "shipper", "consignee"]),
-    reimbursement_record: score(text, ["reimbursement", "voucher", "grossamount", "netinvoice", "paydiscount", "transactionadvice"]),
-    calculation_sheet: score(text, ["subtotal", "provision", "batch", "count", "worksheet", "file no", "fileno"]),
-    table_document: tables.length ? 2 : 0,
-  };
-  const hint = normalizeComparable(domainHint || "");
-  if (hint && hint !== "auto") {
-    for (const key of Object.keys(scores)) {
-      if (normalizeComparable(key).includes(hint) || hint.includes(normalizeComparable(key))) scores[key] += 2;
-    }
-  }
-  const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
-  const [type, bestScore] = sorted[0] || ["document", 0];
   return {
-    type: bestScore > 0 ? type : "document",
-    confidence: bestScore >= 4 ? "high" : bestScore >= 2 ? "medium" : "low",
-    reasons: sorted.filter(([, value]) => value > 0).slice(0, 4).map(([name, value]) => ({ name, score: value })),
+    type: tables.length ? "table_document_candidate" : "document",
+    confidence: "low",
+    reasons: [{
+      source: "legacy_fallback_validator",
+      note: "No model-derived universal_document_semantics_v2 classification was available; local keyword classification is disabled.",
+      domain_hint: domainHint || "auto",
+    }],
+    needs_review: true,
   };
 }
 
@@ -557,51 +549,22 @@ function reindexRelationships(relationships: any[], entities: any[]): any[] {
 }
 
 function findTypedValues(text: string): any[] {
-  const values: any[] = [];
-  const patterns: Array<[string, RegExp]> = [
-    ["amount", /\b(?:HKD|USD|RMB|CNY|\$)\s*[-+]?\d[\d,]*(?:\.\d{1,2})?\b/gi],
-    ["date", /\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}[- ][A-Za-z]{3,9}[- ]\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b/g],
-    ["identifier", /\b[A-Z]{2,6}\d{4,12}[A-Z0-9-]*\b/g],
-    ["account_number", /\b\d{3}-\d{6}-\d{3}\b/g],
-    ["code", /\b[0-9A-Z]{1,4}[A-Z]-[0-9A-Z]{1,6}\b/g],
-  ];
-  for (const [type, regex] of patterns) {
-    for (const match of text.matchAll(regex)) {
-      values.push({ type, value: match[0] });
-    }
-  }
-  return values;
+  void text;
+  return [];
 }
 
 function findOrganizations(text: string): string[] {
-  const organizations: string[] = [];
-  const regex = /\b[A-Z][A-Z0-9 &'().,-]{2,80}\b(?:LIMITED|LTD\.?|COMPANY|BANK|CORPORATION|INC\.?)\b/gi;
-  for (const match of text.matchAll(regex)) {
-    organizations.push(match[0].replace(/\s+/g, " ").trim());
-  }
-  return [...new Set(organizations)];
+  void text;
+  return [];
 }
 
 function classifyValue(value: string): { type: string; confidence: Confidence } | null {
-  const text = String(value || "").trim();
-  if (!text) return null;
-  if (/^(?:HKD|USD|RMB|CNY|\$)?\s*[-+]?\d[\d,]*(?:\.\d{1,2})?$/.test(text)) return { type: "amount", confidence: "medium" };
-  if (/^(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}[- ][A-Za-z]{3,9}[- ]\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})$/.test(text)) return { type: "date", confidence: "medium" };
-  if (/^[A-Z]{4}\d{7}$/.test(text)) return { type: "container_number", confidence: "high" };
-  if (/^\d{3}-\d{6}-\d{3}$/.test(text)) return { type: "account_number", confidence: "high" };
-  if (/^[A-Z]{2,6}\d{4,12}[A-Z0-9-]*$/.test(text)) return { type: "identifier", confidence: "medium" };
+  void value;
   return null;
 }
 
 function classifyFieldName(name: string): { type: string; confidence: Confidence } | null {
-  const normalized = normalizeComparable(name);
-  if (!normalized) return null;
-  if (normalized.includes("amount") || normalized.includes("total") || normalized.includes("金額")) return { type: "amount", confidence: "medium" };
-  if (normalized.includes("date") || normalized.includes("日期")) return { type: "date", confidence: "medium" };
-  if (normalized.includes("cheque") || normalized.includes("check") || normalized.includes("支票")) return { type: "cheque", confidence: "medium" };
-  if (normalized.includes("invoice") || normalized.includes("發票")) return { type: "invoice", confidence: "medium" };
-  if (normalized.includes("account") || normalized.includes("戶口")) return { type: "account", confidence: "medium" };
-  if (normalized.includes("company") || normalized.includes("vendor") || normalized.includes("client") || normalized.includes("公司")) return { type: "organization", confidence: "medium" };
+  void name;
   return null;
 }
 

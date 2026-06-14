@@ -6,8 +6,8 @@
  *   table                        → L1-L5 layered pipeline (needs bbox for columns)
  *
  * v9 simplifications:
- * - Removed L2 per-field OCR with dedicated model (qwen-vl-ocr)
- * - Removed second-pass correction (qwen3-vl-flash)
+ * - Removed L2 per-field OCR with a dedicated OCR model
+ * - Removed second-pass correction with a separate fallback model
  * - Removed L3 cross-validate LLM call (multi-pass voting replaces it)
  * - Post-processing now only does safe normalizations (trim, date separators)
  * - Multi-pass uses temperature annealing (0 → 0.03, early stop)

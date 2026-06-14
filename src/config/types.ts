@@ -165,7 +165,7 @@ export interface LosslessDocumentResult {
   source_path?: string;
   pages: LosslessPage[];
   finalJson: Record<string, any>;
-  universal_schema?: "universal_document_semantics_v1";
+  universal_schema?: "universal_document_semantics_v1" | "universal_document_semantics_v2";
   extraction_policy?: Record<string, any>;
   raw_pages?: any[];
   semantic_pages?: any[];

@@ -96,21 +96,7 @@ export function fieldValueLooksValid(value: string, spec: FieldSpec): boolean {
   const trimmed = value.trim();
   if (!trimmed) return spec.required === false;
   if (trimmed.includes("[?]")) return false;
-
-  const name = spec.name.toLowerCase();
-  const hint = (spec.formatHint || "").toLowerCase();
-  const compact = compactFieldValue(trimmed);
-
-  if (name.includes("charge_code")) return /^\d{2,5}$/.test(compact);
-  if (name.includes("client") || hint.includes("9 digits")) return /^\d{9}$/.test(compact);
-  if (name.includes("container") || hint.includes("four letters")) return /^[A-Z]{4}\d{7}$/.test(compact);
-  if (name.includes("seal")) return /^[A-Z0-9]{6,12}$/.test(compact);
-  if (name.includes("bl_") || hint.includes("two letters")) return /^[A-Z]{2}\d{5}[A-Z]$/.test(compact);
-  if (name.includes("date") || hint.includes("dd.mm.yy")) return /^\d{2}[./-]\d{2}[./-]\d{2,4}$/.test(trimmed);
-  if (name.includes("amount") || name.includes("total") || hint.includes("currency")) {
-    return /^\d+(?:\.\d{2})$/.test(trimmed.replace(/,/g, ""));
-  }
-
+  void spec;
   return true;
 }
 

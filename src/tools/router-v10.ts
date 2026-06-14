@@ -22,9 +22,10 @@ import { handleEstimateTokens, handlePdfInfo, handleBatchStatus, handleBatchStat
 import { handleAnalyzeImage } from "./image-analyze.js";
 import { handleAnalyzePdf } from "./pdf-analyze.js";
 import { handleAnalyzeVideo, handleAnalyzeVideoChunked } from "./video.js";
-import { handleExtractFields, handleExtractVerify, handleHandwriting } from "./extraction.js";
+import { handleExtractVerify } from "./extraction.js";
 import { aggregateLosslessPages } from "../extraction/lossless.js";
-import { buildUniversalSemanticResult } from "../extraction/semantic.js";
+import { extractLosslessDocument } from "../extraction/lossless.js";
+import { writeUniversalFinalOutputs } from "../output/universal-writer.js";
 import { submitBatchedJobs } from "../batch/manager.js";
 import { getPdfPageCount, getPdfType, renderPageSmart } from "../rendering/pdf.js";
 import {
@@ -102,6 +103,7 @@ export class ToolRouter {
   }
 
   private markReviewFields(result: any): any {
+    if (result?.universal_schema === "universal_document_semantics_v2") return result;
     const clone = result && typeof result === "object" ? structuredClone(result) : result;
     const visit = (node: any) => {
       if (!node || typeof node !== "object") return;
@@ -321,6 +323,26 @@ export class ToolRouter {
     return join(outputPath, `${base}-p${page}.${ext}`);
   }
 
+  private resolveExtractionOutputDir(outputDir: string | undefined, inputPath: string, enabled: boolean): string | undefined {
+    if (!enabled) return undefined;
+    if (outputDir && String(outputDir).trim()) return String(outputDir);
+    const base = parse(inputPath).name.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_") || "document";
+    return join(dirname(inputPath), `vision_extract_${base}_${this.timestampForPath(new Date())}`);
+  }
+
+  private timestampForPath(date: Date): string {
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return [
+      date.getFullYear(),
+      pad(date.getMonth() + 1),
+      pad(date.getDate()),
+      "_",
+      pad(date.getHours()),
+      pad(date.getMinutes()),
+      pad(date.getSeconds()),
+    ].join("");
+  }
+
   private sourceArtifact(filePath: string, mediaType: "pdf" | "image" | "video" | "unknown"): any {
     return {
       role: "trusted_original",
@@ -435,7 +457,9 @@ export class ToolRouter {
     const mediaType = this.mediaType(filePath);
     const policy = resolveAccuracyPolicy(args);
     const attentionFields = this.normalizeAttentionFields(args.attention_fields, fields);
-    const extractionFields = fields?.length ? fields : attentionFields;
+    const extractionFields = attentionFields;
+    const outputDir = this.resolveExtractionOutputDir(args.output_dir, filePath, args.save_outputs !== false && args.writer_mode !== "none");
+    const writerMode = args.writer_mode || "jsonl_checkpoint_then_bulk_export";
     const prompt = this.buildFieldPrompt(extractionFields || [], args);
     const { value, elapsedMs } = await timed(async () => {
       if (mediaType === "pdf") {
@@ -477,7 +501,11 @@ export class ToolRouter {
           output_grain: args.output_grain || "auto",
           integration_mode: args.integration_mode || "none",
           extract_all_fields: args.extract_all_fields !== false,
-          writer_mode: args.writer_mode,
+          output_dir: outputDir,
+          save_outputs: args.save_outputs !== false,
+          export_formats: args.export_formats,
+          writer_mode: writerMode,
+          resume_from: args.resume_from,
         });
         const parsed = this.parseToolJson(result);
         if (parsed?.results) {
@@ -492,76 +520,79 @@ export class ToolRouter {
             renderScale: args.render_scale,
             maxApiConcurrency: args.max_api_concurrency ?? policy.concurrency,
             renderConcurrency: args.render_concurrency,
-            writerMode: args.writer_mode,
+            writerMode,
+            outputDir,
+            saveOutputs: args.save_outputs !== false,
+            exportFormats: args.export_formats,
+            resumeFrom: args.resume_from,
           });
         }
         return parsed;
       }
       if (mediaType === "image") {
-        if (args.document_type === "handwriting" && fields?.length === 1 && /text|hand/i.test(fields[0].name || "")) {
-          return this.parseToolJson(await handleHandwriting(this.provider, {
-            image_path: filePath,
-            prompt,
-            language_hint: args.language_hint,
-          }));
-        }
-        const imageResult = this.parseToolJson(await handleExtractFields(this.provider, {
-          image_path: filePath,
-          fields: extractionFields,
-          preserve_all: args.preserve_all !== false,
-          output_schema: args.output_schema || "lossless_document_v1",
-          max_tokens: args.max_tokens ?? MAX_OUTPUT_TOKENS,
-          use_ocr_model: policy.ocrVerify,
-          preprocess: args.preprocess !== false,
-          strategy: args.strategy || (args.document_type && args.document_type !== "auto" ? undefined : "auto"),
-          enable_thinking: args.enable_thinking,
-          self_consistency_votes: policy.selfConsistencyVotes,
-          cost_policy: args.cost_policy,
-          cache_policy: args.cache_policy,
-          return_cost_breakdown: args.return_cost_breakdown !== false,
-          budget_hint_usd: args.budget_hint_usd,
-          max_unverified_required_fields: args.max_unverified_required_fields,
-          provider_mode: args.provider_mode || "auto",
-          extraction_style: args.extraction_style || "model_first",
-          verification_mode: args.verification_mode || "strict",
-          return_evidence: args.return_evidence !== false,
-          return_quality_report: args.return_quality_report !== false,
-        }));
-        return imageResult?.schema === "lossless_document_v1"
-          ? buildUniversalSemanticResult(imageResult, {
-              sourcePath: filePath,
-              attentionFields,
-              attentionRules: args.attention_rules,
-              domainHint: args.domain_hint || "auto",
-              semanticMode: args.semantic_mode || "auto",
-              outputGrain: args.output_grain || "auto",
-              integrationMode: args.integration_mode || "none",
-              extractAllFields: args.extract_all_fields !== false,
-              renderScale: args.render_scale,
-              maxApiConcurrency: args.max_api_concurrency ?? policy.concurrency,
-              renderConcurrency: args.render_concurrency,
-              writerMode: args.writer_mode,
-            })
-          : imageResult;
+        return extractLosslessDocument(this.provider, readFileSync(filePath), extToMime(extname(filePath).toLowerCase()), extractionFields, {
+          page: 1,
+          sourcePath: filePath,
+          maxTokens: args.max_tokens ?? MAX_OUTPUT_TOKENS,
+          vlHighResolutionImages: policy.vlHighResolutionImages,
+          returnCostBreakdown: args.return_cost_breakdown !== false,
+          maxUnverifiedRequiredFields: args.max_unverified_required_fields,
+          costPolicy: args.cost_policy,
+          cachePolicy: args.cache_policy,
+          minPixels: args.min_pixels,
+          maxPixels: args.max_pixels,
+          providerMode: args.provider_mode || "auto",
+          extractionStyle: args.extraction_style || "model_first",
+          verificationMode: args.verification_mode || "strict",
+          returnEvidence: args.return_evidence !== false,
+          returnQualityReport: args.return_quality_report !== false,
+          attentionFields,
+          attentionRules: args.attention_rules,
+          domainHint: args.domain_hint || "auto",
+          semanticMode: args.semantic_mode || "auto",
+          outputGrain: args.output_grain || "auto",
+          integrationMode: args.integration_mode || "none",
+          extractAllFields: args.extract_all_fields !== false,
+          renderScale: args.render_scale,
+          maxApiConcurrency: args.max_api_concurrency ?? policy.concurrency,
+          renderConcurrency: args.render_concurrency,
+          outputDir,
+          saveOutputs: args.save_outputs !== false,
+          exportFormats: args.export_formats,
+          writerMode,
+          resumeFrom: args.resume_from,
+        });
       }
       return { error: `Unsupported extraction file type: ${extname(filePath)}` };
     });
 
     const reviewed = this.markReviewFields(value);
+    const outputArtifacts =
+      args.save_outputs !== false && outputDir && writerMode !== "none" && reviewed?.universal_schema === "universal_document_semantics_v2"
+        ? await writeUniversalFinalOutputs(reviewed, {
+            outputDir,
+            sourcePath: filePath,
+            writerMode,
+            exportFormats: args.export_formats,
+          })
+        : [];
     const reviewedWithArtifacts =
-      args.return_artifacts && reviewed && typeof reviewed === "object"
+      reviewed && typeof reviewed === "object"
         ? {
             ...reviewed,
             artifacts: [
               ...(Array.isArray((reviewed as any).artifacts) ? (reviewed as any).artifacts : []),
-              this.sourceArtifact(filePath, mediaType),
-              {
-                role: mediaType === "pdf" ? "rendered_lossless_png_ocr_candidate" : "original_lossless_or_png_ocr_candidate",
-                mime: mediaType === "pdf" ? "image/png" : extToMime(extname(filePath).toLowerCase()),
-                pages: Array.isArray((reviewed as any).pages) ? (reviewed as any).pages.map((p: any) => p.page) : undefined,
-                derived_from: "trusted_original",
-                lossy: false,
-              },
+              ...(args.return_artifacts ? [
+                this.sourceArtifact(filePath, mediaType),
+                {
+                  role: mediaType === "pdf" ? "rendered_lossless_png_universal_candidate" : "original_lossless_or_png_universal_candidate",
+                  mime: mediaType === "pdf" ? "image/png" : extToMime(extname(filePath).toLowerCase()),
+                  pages: Array.isArray((reviewed as any).pages) ? (reviewed as any).pages.map((p: any) => p.page) : undefined,
+                  derived_from: "trusted_original",
+                  lossy: false,
+                },
+              ] : []),
+              ...outputArtifacts,
             ],
           }
         : reviewed;
@@ -585,6 +616,9 @@ export class ToolRouter {
         extraction_style: args.extraction_style || "model_first",
         verification_mode: args.verification_mode || "strict",
         return_quality_report: args.return_quality_report !== false,
+        output_dir: outputDir,
+        writer_mode: writerMode,
+        export_formats: args.export_formats || ["jsonl", "json", "xlsx", "markdown"],
       },
       results: reviewedWithArtifacts,
       metrics: { elapsed_ms: elapsedMs, ...metrics },

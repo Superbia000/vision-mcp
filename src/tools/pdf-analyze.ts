@@ -63,6 +63,10 @@ export async function handleAnalyzePdf(
     output_grain: args.output_grain,
     integration_mode: args.integration_mode,
     extract_all_fields: args.extract_all_fields,
+    output_dir: args.output_dir,
+    save_outputs: args.save_outputs,
+    export_formats: args.export_formats,
+    resume_from: args.resume_from,
     render_scale: renderScale,
     max_api_concurrency: args.max_api_concurrency,
     render_concurrency: renderConcurrency,
@@ -236,6 +240,11 @@ async function handleConcurrentStrategy(
                   outputGrain: extractionOptions.output_grain,
                   integrationMode: extractionOptions.integration_mode,
                   extractAllFields: extractionOptions.extract_all_fields,
+                  outputDir: extractionOptions.output_dir,
+                  saveOutputs: extractionOptions.save_outputs !== false,
+                  exportFormats: extractionOptions.export_formats,
+                  writerMode: extractionOptions.writer_mode,
+                  resumeFrom: extractionOptions.resume_from,
                 }),
                 `Page ${x.page} (lossless)`
               )
@@ -417,6 +426,11 @@ async function handleMultiImageStrategy(
                   outputGrain: extractionOptions.output_grain,
                   integrationMode: extractionOptions.integration_mode,
                   extractAllFields: extractionOptions.extract_all_fields,
+                  outputDir: extractionOptions.output_dir,
+                  saveOutputs: extractionOptions.save_outputs !== false,
+                  exportFormats: extractionOptions.export_formats,
+                  writerMode: extractionOptions.writer_mode,
+                  resumeFrom: extractionOptions.resume_from,
                 }),
                 `Page ${p.page} (lossless)`
               ).then((res: any) => ({

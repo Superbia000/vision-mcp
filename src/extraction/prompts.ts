@@ -2,7 +2,7 @@
  * Vision-MCP v9: Adaptive reading prompts by document category.
  *
  * Three prompt templates selected by detectDocumentType():
- *   scan       → printed text on scanned documents (invoices, B/L, forms)
+ *   scan       → printed text on scanned documents
  *   photo      → camera-captured document photos
  *   handwriting/mixed → handwritten or mixed print+handwriting documents
  *
@@ -183,9 +183,8 @@ export function buildFieldExtractionPrompt(
   prompt += `\n\n欄位輸出規則：`;
   prompt += `\n- 每個輸出物件的 "name" 必須完全等於 requested_fields 的 name。`;
   prompt += `\n- "label" 寫文件中實際看見的標籤；"value" 只寫該欄位要求的值，不要寫解釋。`;
-  prompt += `\n- 如果 name 或 return_value_shape 指向 charge code，只返回該收費列最左側的數字代碼，不要返回金額。`;
-  prompt += `\n- 如果 name 或 return_value_shape 指向 amount/currency/total，只返回金額數字。`;
-  prompt += `\n- 對 container、seal、B/L、client number、invoice number 逐字閱讀；特別區分 O/0、I/1/L、S/5、B/8、M/N、U/V。`;
+  prompt += `\n- 根據 requested field 的 label、format hint 和文件可見上下文讀取對應值；不要把鄰近欄位或標籤文字混入 value。`;
+  prompt += `\n- 對所有字母與數字逐字閱讀；特別區分 O/0、I/1/L、S/5、B/8、M/N、U/V。`;
   prompt += `\n- 有任何字元不確定時，confidence 不能是 high，並用 [?] 標示不確定字元。`;
   prompt += `\n\n請返回 JSON，格式必須是：`;
   prompt += `\n{ "fields": [ { "name": "requested_name", "label": "visible label", "value": "exact visible value", "confidence": "high|medium|low" } ] }`;

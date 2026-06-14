@@ -2,7 +2,7 @@
  * Vision-MCP v8: L2 - Per-Field OCR Extraction (enhanced)
  *
  * v8 improvements:
- * - Dedicated OCR model (qwen-vl-ocr-2025-11-20) with vl_high_resolution_images
+ * - Configured single vision model with vl_high_resolution_images
  * - temperature=0 for deterministic extraction
  * - response_format: json_object for structured output
  * - Enhanced prompt with format hints, examples, and allowed values
